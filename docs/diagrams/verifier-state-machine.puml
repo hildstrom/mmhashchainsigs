@@ -1,0 +1,44 @@
+@startuml verifier-state-machine
+title verifier_ctx_t — State Machine
+
+skinparam shadowing false
+skinparam state {
+    BackgroundColor #fdfdfd
+    BorderColor #555555
+}
+
+[*] --> EXPECT_INIT : verifier_init()
+
+state EXPECT_INIT : Waiting for the first line.\nMust carry an INIT SD element\nwhose pubkey fingerprint matches.
+state PROCESSING : Chain is live.\nEach line updates the chain;\nSIG lines verify signatures.
+state ERROR : Unrecoverable: bad INIT,\nfingerprint mismatch, etc.\nFurther process_line() returns -1.
+state DONE : verifier_finalize() called.\nNo more lines accepted.
+
+EXPECT_INIT --> PROCESSING : valid INIT SD\n(fingerprint OK,\nchain_hash = IV)
+
+EXPECT_INIT --> ERROR : line is not an INIT SD\n/ missing siglog SD\n/ fingerprint mismatch
+
+PROCESSING --> PROCESSING : MSG SD\n(hash chain update)
+PROCESSING --> PROCESSING : SIG SD\n(hash + verify signature;\nadd_error on mismatch)
+PROCESSING --> PROCESSING : CONTINUE SD\n(segment_count++)
+PROCESSING --> PROCESSING : new INIT SD\n(multi-segment file:\nstart fresh chain;\nstrict-mode warning on\nunsigned tail of prior segment)
+
+PROCESSING --> ERROR : chain init failure\n/ hash error
+
+EXPECT_INIT --> DONE : verifier_finalize()\n(add_error "empty file")
+PROCESSING --> DONE : verifier_finalize()\n(strict-mode add_error\nif unsigned tail)
+
+ERROR --> DONE : verifier_finalize()
+
+note right of PROCESSING
+  Recoverable errors (chain hash mismatch,
+  invalid signature, sequence skew) are
+  recorded via add_error() but do NOT
+  drop the state out of PROCESSING.
+  Only structural problems (bad INIT,
+  fingerprint mismatch) transition to ERROR.
+end note
+
+DONE --> [*]
+
+@enduml

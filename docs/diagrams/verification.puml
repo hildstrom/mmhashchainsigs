@@ -1,0 +1,65 @@
+@startuml verification
+title mmhashchainsigs-verify — Verification Sequence
+
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+
+actor Operator
+participant "mmhashchainsigs-verify\n(CLI)" as CLI
+participant "verifier_ctx_t" as Ctx
+participant "hcs_format\n(SD parse/strip)" as Fmt
+participant "hcs_crypto\n(hash + verify)" as Crypto
+database "log file" as File
+entity "public key (.pem)" as Pub
+
+Operator -> CLI : argv: -k pub.pem path/to/log
+CLI -> Ctx : verifier_init(ctx, pub.pem, strict)
+Ctx -> Crypto : load + fingerprint pubkey
+Crypto -> Pub : read PEM
+Pub --> Crypto
+Crypto --> Ctx : EVP_PKEY*, pubkey_fp
+CLI -> File : fopen()
+
+loop while getline(&line, ...) != -1
+    CLI -> Ctx : verifier_process_line(line)
+    Ctx -> Fmt : hcs_strip_sd_from_line(line)
+    Fmt --> Ctx : payload bytes,\nhcs_sd_record_t {type, seq, h, ...}
+
+    alt sd.type == INIT
+        Ctx -> Ctx : check pubkey_fp matches
+        Ctx -> Crypto : hcs_chain_init_hash() -> IV
+        Ctx -> Ctx : chain_hash = IV; next_seq = 1
+    end
+
+    Ctx -> Crypto : hcs_sha256_chain(\n  chain_hash, next_seq, payload)
+    Crypto --> Ctx : H(n)
+    Ctx -> Ctx : compare H(n) vs sd.chain_hash
+    note right of Ctx : mismatch -> add_error()
+
+    alt sd.type == SIG
+        Ctx -> Crypto : hcs_ed25519_verify(\n  pubkey, chain_hash, sd.signature)
+        Crypto --> Ctx : 0 / 1 / -1
+        note right of Ctx
+          0  signature valid
+          1  invalid (add_error)
+          -1 verify error (add_error)
+        end note
+        Ctx -> Ctx : last_signed_seq = sd.seq_to
+    end
+
+    Ctx -> Ctx : next_seq++; msg_count++
+end
+
+CLI -> Ctx : verifier_finalize()
+alt strict && next_seq-1 > last_signed_seq
+    Ctx -> Ctx : add_error("N messages\nat tail are unsigned")
+end
+
+CLI -> Ctx : verifier_passed()?
+alt pass
+    CLI -> Operator : "PASS: N messages verified, S signature blocks"\nexit 0
+else fail
+    CLI -> Operator : "FAIL: ... errors", exit 1 (or 3 if fingerprint mismatch)
+end
+
+@enduml

@@ -1,0 +1,63 @@
+@startuml message-processing
+title mmhashchainsigs — End-to-end Message Processing (one message)
+
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+
+actor Application as App
+participant "Kernel\n(unix socket /\nTCP)" as Kernel
+participant "rsyslog imuxsock/\nimptcp" as Input
+participant "rsyslog parser\n(rfc3164 / rfc5424)" as Parser
+participant "RuleEngine" as Engine
+participant "mmhashchainsigs\n(doAction)" as MMHCS
+participant "hashchain" as Chain
+participant "signer" as Signer
+participant "omfile\n(sd-preserve)" as Omfile
+database "log file" as File
+
+App -> Kernel : syslog payload
+Kernel -> Input : sendto()
+Input -> Parser : raw octets
+Parser -> Parser : populate smsg_t fields\n(PRI, TS, HOST, APP, ...,\n%STRUCTURED-DATA%, %msg%)
+Parser -> Engine : smsg_t
+Engine -> MMHCS : action(smsg_t)
+
+activate MMHCS
+MMHCS -> MMHCS : msg = getMSG(pMsg)
+MMHCS -> MMHCS : capture pri, ts, host,\napp, procid, msgid\nfrom pMsg fields
+MMHCS -> MMHCS : hdr_sd = hcs_format_sd_hdr(\n  pri, ts, host, app, procid, msgid)
+MMHCS -> MMHCS : cur_sd = MsgGetStructuredData(pMsg)
+MMHCS -> MMHCS : stripped = hcs_strip_all_sd(\n  cur_sd, HCS_SD_ID)\nstripped = hcs_strip_all_sd(\n  stripped, HCS_SD_HDR_ID)
+note right of MMHCS
+  Drops any client-supplied
+  [mmhashchainsigs@32473 ...] or
+  [mmhashchainsigs-hdr@32473 ...]
+  element (collision policy).
+end note
+MMHCS -> MMHCS : cleaned_sd = hdr_sd || stripped
+MMHCS -> MMHCS : payload = cleaned_sd || msg
+
+MMHCS -> Chain : hashchain_update(payload)
+Chain -> Chain : H(n) = SHA-256(\n  H(n-1) || seq(n) || payload)
+Chain --> MMHCS : new chain hash
+
+alt msg_count >= sign_interval
+    MMHCS -> Signer : signer_sign(chain_hash)
+    Signer --> MMHCS : Ed25519 signature
+    MMHCS -> MMHCS : format SIG SD element\n(t="S", q, h, qf, qt, s)
+    MMHCS -> Chain : hashchain_reset_count()
+else first message
+    MMHCS -> MMHCS : format INIT SD element\n(t="I", q, h, f)
+else ordinary message
+    MMHCS -> MMHCS : format MSG SD element\n(q, h)
+end
+
+MMHCS -> MMHCS : new_sd = siglog_SD || cleaned_sd
+MMHCS -> Engine : MsgSetStructuredData(new_sd)
+deactivate MMHCS
+
+Engine -> Omfile : enriched smsg_t
+Omfile -> Omfile : render template\n"%STRUCTURED-DATA%%msg%\\n"
+Omfile -> File : write("[mmhashchainsigs@32473 ...]\n[mmhashchainsigs-hdr@32473 ...]\n[cleaned_client_SD]MSG\\n")
+
+@enduml

@@ -1,0 +1,57 @@
+@startuml architecture
+title mmhashchainsigs — Component Architecture
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam component {
+    BackgroundColor #fdfdfd
+    BorderColor #555555
+}
+
+package "rsyslog host process" {
+    component "imuxsock /\nimptcp /\nimrelp" as Input
+    component "RuleEngine" as Engine
+
+    package "mmhashchainsigs.so" {
+        component "mmhashchainsigs\n(doAction)" as MMHCS
+        component "hashchain\n(SHA-256 chain)" as Chain
+        component "signer\n(Ed25519)" as Signer
+    }
+
+    component "omfile" as Omfile
+    component "omrelp" as Omrelp
+}
+
+package "hcs shared library" {
+    component "hcs_crypto\n(SHA-256, Ed25519, key load)" as Crypto
+    component "hcs_format\n(SD parse/format/strip)" as Format
+}
+
+package "verification tool" {
+    component "mmhashchainsigs-verify\n(CLI)" as VerifyCLI
+    component "verifier\n(state machine)" as Verifier
+}
+
+file "Ed25519 private key\n(0600)" as Privkey
+file "Ed25519 public key" as Pubkey
+file "/var/log/...secure.log" as LogFile
+
+Input --> Engine
+Engine --> MMHCS
+MMHCS --> Chain : update
+MMHCS --> Signer : sign chain hash
+MMHCS --> Format : format SD element\nstrip client SDs
+Chain ..> Crypto : hcs_sha256_chain
+Signer ..> Crypto : hcs_ed25519_sign
+Signer ..> Privkey : load on startup
+Engine --> Omfile : enriched smsg_t
+Engine --> Omrelp : enriched smsg_t
+Omfile --> LogFile
+
+VerifyCLI --> Verifier
+Verifier ..> Format : hcs_strip_sd_from_line\nhcs_parse_sd
+Verifier ..> Crypto : hcs_sha256_chain\nhcs_ed25519_verify
+Verifier ..> Pubkey : load on startup
+LogFile --> VerifyCLI : getline()
+
+@enduml

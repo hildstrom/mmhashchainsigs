@@ -1,0 +1,29 @@
+# Example rsyslog configuration for mmhashchainsigs
+#
+# Generate keys first:
+#   tools/mmhashchainsigs-keygen.sh /etc/rsyslog.d/
+#
+# Verify logs (received side):
+#   mmhashchainsigs-verify -k /path/to/mmhashchainsigs-public.pem /var/log/secure-audit.log
+
+module(load="mmhashchainsigs")
+
+# Template that preserves structured data when writing to a file.
+template(name="sd-preserve" type="string"
+    string="%STRUCTURED-DATA%%msg%\n")
+
+# Sign each message, then forward over RELP and also write a local copy.
+*.* {
+    action(
+        type="mmhashchainsigs"
+        privatekey="/etc/rsyslog.d/mmhashchainsigs-private.pem"
+        signinterval="1024"
+    )
+    action(type="omrelp" target="logserver" port="514")
+    action(
+        type="omfile"
+        file="/var/log/secure-audit.log"
+        template="sd-preserve"
+        filecreatemode="0600"
+    )
+}

@@ -1,0 +1,59 @@
+@startuml pipeline
+title mmhashchainsigs — RELP Deployment Pipeline
+
+skinparam shadowing false
+skinparam node {
+    BackgroundColor #fdfdfd
+    BorderColor #555555
+}
+
+node "Origin host" as Origin {
+    component "application(s)" as App
+    node "rsyslog" as RsyslogA {
+        component "imuxsock" as InA
+        component "mmhashchainsigs" as MMA
+        component "omrelp" as RelpOut
+    }
+    file "siglog-private.pem\n(mode 0600)" as PrivKey
+}
+
+cloud "TLS / RELP" as RELP
+
+node "Receiver host" as Receiver {
+    node "rsyslog" as RsyslogB {
+        component "imrelp" as RelpIn
+        component "omfile\n(sd-preserve)" as OmfileB
+    }
+    file "/var/log/<host>.log" as LogFile
+}
+
+node "Audit station" as Audit {
+    component "mmhashchainsigs-verify" as Verifier
+    file "siglog-public.pem" as PubKey
+}
+
+App --> InA : syslog()
+InA --> MMA : smsg_t
+MMA --> RelpOut : smsg_t + siglog SD
+PrivKey ..> MMA : load at start
+RelpOut --> RELP
+RELP --> RelpIn
+RelpIn --> OmfileB
+OmfileB --> LogFile : append line\n[siglog SD][client SD]MSG\\n
+
+LogFile -> Verifier : copy / fetch / mount
+PubKey ..> Verifier
+
+note bottom of Receiver
+  Receiver stores messages verbatim
+  through the sd-preserve template;
+  it holds no signing keys.
+end note
+
+note bottom of Audit
+  Verifier needs only the public key
+  and the log file. It can run on a
+  different host -- or later in time.
+end note
+
+@enduml
