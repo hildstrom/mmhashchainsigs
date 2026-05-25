@@ -199,7 +199,7 @@ message:
 2. `[mmhashchainsigs-hdr@32473 ...]` — a snapshot of the six syslog
    header fields captured at signing time. This element is part of the
    integrity-protected payload (the verifier hashes it just like any
-   other byte after the leading siglog element).
+   other byte after the leading mmhashchainsigs element).
 
 ### Chain metadata element shapes
 

@@ -52,7 +52,7 @@ else ordinary message
     MMHCS -> MMHCS : format MSG SD element\n(q, h)
 end
 
-MMHCS -> MMHCS : new_sd = siglog_SD || cleaned_sd
+MMHCS -> MMHCS : new_sd = mmhashchainsigs_SD || cleaned_sd
 MMHCS -> Engine : MsgSetStructuredData(new_sd)
 deactivate MMHCS
 

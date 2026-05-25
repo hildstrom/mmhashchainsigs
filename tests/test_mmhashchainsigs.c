@@ -463,8 +463,8 @@ typedef struct {
  *      [mmhashchainsigs-hdr@32473 ...] elements (collision policy).
  *   3. cleaned_sd = hdr_sd || stripped_client_sd
  *   4. Hash cleaned_sd || MSG.
- *   5. Prepend the freshly produced siglog SD element.
- * The output line is then siglog_sd + cleaned_sd + MSG, which is what
+ *   5. Prepend the freshly produced mmhashchainsigs SD element.
+ * The output line is then mmhashchainsigs_sd + cleaned_sd + MSG, which is what
  * `omfile` writes with the sd-preserve template.
  */
 static int doaction_simulate(
@@ -688,7 +688,7 @@ static void test_hdr_tamper_detect(void)
 {
     /* Tamper with a header value in the stored line. Because the hdr
      * SD is part of the hashed payload (the verifier strips only the
-     * leading siglog SD), the chain hash for that message must fail. */
+     * leading mmhashchainsigs SD), the chain hash for that message must fail. */
     mmhashchainsigs_instance_t inst = {
         .privkey_path = privkey_path,
         .sign_interval = 3,

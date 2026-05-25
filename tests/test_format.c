@@ -284,7 +284,7 @@ static void test_strip_all_out_too_small(void)
 static void test_strip_all_hdr_id(void)
 {
     /* The same helper used with HCS_SD_HDR_ID strips the hdr element
-     * but leaves the (also-present) siglog element untouched. */
+     * but leaves the (also-present) mmhashchainsigs element untouched. */
     const char *src =
         "[mmhashchainsigs@32473 q=\"1\" h=\"00\"]"
         "[mmhashchainsigs-hdr@32473 pri=\"13\" ts=\"-\" host=\"\""

@@ -163,7 +163,7 @@ PlantUML sources live in `docs/diagrams/`:
 | File | What it shows |
 |------|---------------|
 | `architecture.puml` | Component view: rsyslog, mmhashchainsigs, hashchain, signer, hcs library, verifier |
-| `pipeline.puml` | Deployment view: signing origin → RELP → receiving rsyslog → omfile → siglog-verify |
+| `pipeline.puml` | Deployment view: signing origin → RELP → receiving rsyslog → omfile → mmhashchainsigs-verify |
 | `message-processing.puml` | End-to-end sequence diagram for one message through `doAction` and onto disk |
 | `verification.puml` | Sequence diagram for `mmhashchainsigs-verify` reading and validating a log file |
 | `verifier-state-machine.puml` | State diagram for `verifier_ctx_t` (`EXPECT_INIT` → `PROCESSING` → `DONE`/`ERROR`) |

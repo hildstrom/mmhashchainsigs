@@ -16,7 +16,7 @@ state DONE : verifier_finalize() called.\nNo more lines accepted.
 
 EXPECT_INIT --> PROCESSING : valid INIT SD\n(fingerprint OK,\nchain_hash = IV)
 
-EXPECT_INIT --> ERROR : line is not an INIT SD\n/ missing siglog SD\n/ fingerprint mismatch
+EXPECT_INIT --> ERROR : line is not an INIT SD\n/ missing mmhashchainsigs SD\n/ fingerprint mismatch
 
 PROCESSING --> PROCESSING : MSG SD\n(hash chain update)
 PROCESSING --> PROCESSING : SIG SD\n(hash + verify signature;\nadd_error on mismatch)

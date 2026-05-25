@@ -320,7 +320,7 @@ CODESTARTdoAction
         ABORT_FINALIZE(RS_RET_SUSPENDED);
     }
 
-    /* Output SD section: siglog SD || cleaned_SD
+    /* Output SD section: mmhashchainsigs SD || cleaned_SD
      * (cleaned_SD already starts with the hdr element). */
     size_t new_len = (size_t)sd_len + cleaned_len;
     new_sd = malloc(new_len + 1);
