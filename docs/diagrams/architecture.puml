@@ -35,12 +35,14 @@ package "verification tool" {
 file "Ed25519 private key\n(0600)" as Privkey
 file "Ed25519 public key" as Pubkey
 file "/var/log/...secure.log" as LogFile
+file "mmhashchainsigs.state\n(statefiledir)" as StateFile
 
 Input --> Engine
 Engine --> MMHCS
 MMHCS --> Chain : update
 MMHCS --> Signer : sign chain hash
 MMHCS --> Format : format SD element\nstrip client SDs
+MMHCS ..> StateFile : save on shutdown\nload on startup
 Chain ..> Crypto : hcs_sha256_chain
 Signer ..> Crypto : hcs_ed25519_sign
 Signer ..> Privkey : load on startup

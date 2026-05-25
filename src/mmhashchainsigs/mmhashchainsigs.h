@@ -14,10 +14,19 @@
 #include <stdint.h>
 
 #define MMHASHCHAINSIGS_DEFAULT_SIGN_INTERVAL 1024
+#define MMHASHCHAINSIGS_STATE_FILE "mmhashchainsigs.state"
+
+typedef struct mmhashchainsigs_saved_state {
+    unsigned char chain_hash[HCS_HASH_LEN];
+    uint64_t seq;
+    uint64_t sig_seq_from;
+    unsigned char pubkey_fp[HCS_HASH_LEN];
+} mmhashchainsigs_saved_state_t;
 
 typedef struct mmhashchainsigs_instance {
     char *privkey_path;
     char *tpl_name;
+    char *statefiledir;
     unsigned int sign_interval;
 } mmhashchainsigs_instance_t;
 
@@ -25,6 +34,7 @@ typedef struct mmhashchainsigs_worker {
     mmhashchainsigs_instance_t *inst;
     hashchain_ctx_t chain;
     signer_ctx_t signer;
+    mmhashchainsigs_saved_state_t *pending_state;
     uint64_t sig_seq_from;
     int initialized;
     int is_first;
@@ -51,6 +61,46 @@ int mmhashchainsigs_init(mmhashchainsigs_worker_t *wrkr);
  */
 int mmhashchainsigs_process_msg(
     mmhashchainsigs_worker_t *wrkr,
+    const char *payload, size_t payload_len,
+    char *sd_buf, size_t sd_buf_len);
+
+/*
+ * Emit a final signature covering any unsigned tail messages.
+ * Extends the chain with an empty payload, signs, and writes
+ * a SIG SD element to sd_buf.
+ * Returns SD length on success, 0 if no unsigned messages, -1 on error.
+ */
+int mmhashchainsigs_final_sign(
+    mmhashchainsigs_worker_t *wrkr,
+    char *sd_buf, size_t sd_buf_len);
+
+/*
+ * Save chain state to a file for recovery on next startup.
+ * Returns 1 if state was saved, 0 if nothing to save, -1 on error.
+ */
+int mmhashchainsigs_save_state(
+    const mmhashchainsigs_worker_t *wrkr,
+    const char *dir);
+
+/*
+ * Load saved chain state from a file. Caller must free() the result.
+ * Returns the loaded state, or NULL if no state file or parse error.
+ */
+mmhashchainsigs_saved_state_t *mmhashchainsigs_load_state(
+    const char *dir);
+
+/* Remove the state file from the directory. */
+void mmhashchainsigs_delete_state(const char *dir);
+
+/*
+ * Process one message through a restored chain from a previous
+ * shutdown. Signs the message as the final entry of the old chain,
+ * then reinitializes the worker for a fresh chain.
+ * Returns SD length on success, -2 on key mismatch, -1 on error.
+ */
+int mmhashchainsigs_process_final(
+    mmhashchainsigs_worker_t *wrkr,
+    const mmhashchainsigs_saved_state_t *state,
     const char *payload, size_t payload_len,
     char *sd_buf, size_t sd_buf_len);
 

@@ -15,6 +15,7 @@ node "Origin host" as Origin {
         component "omrelp" as RelpOut
     }
     file "mmhashchainsigs-private.pem\n(mode 0600)" as PrivKey
+    file "mmhashchainsigs.state\n(statefiledir)" as StateFile
 }
 
 cloud "TLS / RELP" as RELP
@@ -36,6 +37,7 @@ App --> InA : syslog()
 InA --> MMA : smsg_t
 MMA --> RelpOut : smsg_t + mmhashchainsigs SD
 PrivKey ..> MMA : load at start
+StateFile ..> MMA : save on shutdown\nload on startup
 RelpOut --> RELP
 RELP --> RelpIn
 RelpIn --> OmfileB

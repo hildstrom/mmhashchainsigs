@@ -3,6 +3,11 @@
 # Generate keys first:
 #   tools/mmhashchainsigs-keygen.sh /etc/rsyslog.d/
 #
+# Create state directory (for shutdown state persistence):
+#   mkdir -p /var/lib/mmhashchainsigs
+#   chown root:root /var/lib/mmhashchainsigs
+#   chmod 700 /var/lib/mmhashchainsigs
+#
 # Verify logs (received side):
 #   mmhashchainsigs-verify -k /path/to/mmhashchainsigs-public.pem /var/log/secure-audit.log
 
@@ -13,11 +18,23 @@ template(name="sd-preserve" type="string"
     string="%STRUCTURED-DATA%%msg%\n")
 
 # Sign each message, then forward over RELP and also write a local copy.
+#
+# statefiledir: when set, the module saves chain state on graceful
+# shutdown and restores it on next startup, so the first message after
+# restart carries a final signature covering the previous chain's
+# unsigned tail. Without this, a graceful restart leaves up to
+# signinterval messages unsigned.
+#
+# The hash chain requires strictly sequential processing, so
+# queue.workerThreads must be 1 (the default). The module rejects
+# a second worker thread at startup.
 *.* {
     action(
         type="mmhashchainsigs"
         privatekey="/etc/rsyslog.d/mmhashchainsigs-private.pem"
         signinterval="1024"
+        statefiledir="/var/lib/mmhashchainsigs"
+        queue.workerThreads="1"
     )
     action(type="omrelp" target="logserver" port="514")
     action(

@@ -98,13 +98,20 @@ Message modification module for RELP transmission signing:
 
 1. **Standalone core** (always compiled) -- Hash/sign/SD logic:
    - `mmhashchainsigs_init()` -- Load private key, init hash chain
-   - `mmhashchainsigs_process_msg()` -- Hash `payload` into the chain, produce RFC 5424 SD element (INIT, MSG, or SIG)
-   - `mmhashchainsigs_free()` -- Free signer resources
+   - `mmhashchainsigs_process_msg()` -- Hash `payload` into the chain, produce RFC 5424 SD element (INIT, MSG, or SIG). If a `pending_state` is loaded from a previous shutdown, the first call routes through `process_final` instead.
+   - `mmhashchainsigs_final_sign()` -- Extend the chain with an empty payload and sign (standalone final signature for callers that manage their own output)
+   - `mmhashchainsigs_process_final()` -- Restore a saved chain, hash the real message through it, sign, emit SIG, then reinitialize for a new chain
+   - `mmhashchainsigs_save_state()` -- Atomically write chain state (hash, seq, sig_seq_from, pubkey fingerprint) to a file for recovery on next startup
+   - `mmhashchainsigs_load_state()` -- Read and parse a saved state file
+   - `mmhashchainsigs_delete_state()` -- Remove the state file after consumption
+   - `mmhashchainsigs_free()` -- Free signer resources and any unconsumed pending state
 
 2. **Rsyslog boilerplate** (compiled only without `MMHASHCHAINSIGS_STANDALONE`) -- Module API:
    - Declared via `MODULE_TYPE_OUTPUT` (rsyslog's output module interface)
-   - Configuration parameter parsing (`privatekey`, `signinterval`, `template`)
+   - Configuration parameter parsing (`privatekey`, `signinterval`, `template`, `statefiledir`)
+   - `createWrkrInstance`: rejects a second worker (hash chain requires sequential processing); loads saved state from `statefiledir` if present
    - `doAction` handler: capture six header fields from `pMsg`, format the `[mmhashchainsigs-hdr@32473 ...]` element, strip client `mmhashchainsigs@32473` and `mmhashchainsigs-hdr@32473` SDs if any, hash `hdr_SD || cleaned_client_SD || MSG`, prepend the chain-metadata SD element
+   - `freeWrkrInstance`: saves chain state to `statefiledir` if unsigned messages remain
 
 ### `src/verify/` -- Verification Tool
 
@@ -132,7 +139,7 @@ CLI entry point:
 | `test_signer.c` | 4 | SHA-256 known vector, chain hash, Ed25519 sign/verify roundtrip, fingerprint |
 | `test_format.c` | 20 | Hex, base64, SD INIT/MSG/SIG/CONTINUE roundtrip, SD strip, bad input rejection, `hcs_strip_all_sd` (empty/none/single/multiple/quoted-bracket/out-too-small/hdr-id/in-place), `hcs_format_sd_hdr` (basic/empty-fields/escaping/buf-too-small) |
 | `test_hashchain.c` | 6 | Chain init IV, update, determinism, ordering, count reset, full reset |
-| `test_mmhashchainsigs.c` | 11 | SD chain verify, tamper detect, multi-segment, single message, `mmhashchainsigs_process_msg`, sign-interval=1, RFC 5424 with client SD, RFC 5424 collision (poisoned `mmhashchainsigs@32473`), hdr chain verify, hdr tamper detect, hdr collision (poisoned `mmhashchainsigs-hdr@32473`) |
+| `test_mmhashchainsigs.c` | 17 | SD chain verify, tamper detect, multi-segment, single message, `mmhashchainsigs_process_msg`, sign-interval=1, RFC 5424 with client SD, RFC 5424 collision (poisoned `mmhashchainsigs@32473`), hdr chain verify, hdr tamper detect, hdr collision (poisoned `mmhashchainsigs-hdr@32473`), `final_sign` (covers tail, no unsigned, uninitialized), state save/load roundtrip, state inject+verify (full shutdown/restart flow), state no-unsigned |
 
 All tests generate temporary Ed25519 key pairs at runtime. No test fixtures are
 checked in.
@@ -146,7 +153,7 @@ required. They are not part of `make test` (which runs unit tests only).
 | Script / source | What It Covers |
 |-----------------|----------------|
 | `send_syslog.c` | Opens the unix datagram socket once and sends N RFC 3164 messages -- avoids the cost of forking `logger` per message |
-| `run.sh` | 6 tests: `imuxsock`-based write+verify and tamper detection; `imptcp` + `rsyslog.rfc5424` parser tests for RFC 5424 with client SD, SD-ID collision, distinct-per-message header capture, and header-value tamper detection |
+| `run.sh` | 8 tests: `imuxsock`-based write+verify and tamper detection; `imptcp` + `rsyslog.rfc5424` parser tests for RFC 5424 with client SD, SD-ID collision, distinct-per-message header capture, and header-value tamper detection; `statefiledir` shutdown+restart (state file written, consumed on restart, strict verification passes); no-statefiledir strict-mode unsigned-tail detection |
 | `bench.sh` | Throughput comparison: baseline omfile vs `mmhashchainsigs` + omfile. Also measures `mmhashchainsigs-verify` throughput |
 
 Both scripts run the sender, sleep briefly so rsyslog can drain the socket
@@ -176,7 +183,7 @@ Render with `plantuml docs/diagrams/*.puml` or any PlantUML-aware viewer.
 |--------|---------|--------|----------|
 | Verify tool | `make` or `make verify-tool` | `build/mmhashchainsigs-verify` | OpenSSL |
 | Rsyslog module | `make module` | `build/mmhashchainsigs.so` | OpenSSL + rsyslog-dev |
-| Unit tests | `make test` | `build/tests/test_*` (41 tests) | OpenSSL |
+| Unit tests | `make test` | `build/tests/test_*` (47 tests) | OpenSSL |
 | Integration tests | `make test-integration` | Runs `tests/integration/run.sh` | OpenSSL + rsyslog |
 | Benchmarks | `make bench` | Runs `tests/integration/bench.sh` | OpenSSL + rsyslog |
 | Install | `make install` | Installs to `$PREFIX` | varies |

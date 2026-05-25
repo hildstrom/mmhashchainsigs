@@ -796,6 +796,328 @@ static void test_hdr_collision(void)
     printf("  PASS: test_hdr_collision\n");
 }
 
+static void test_final_sign_covers_tail(void)
+{
+    /*
+     * Process 6 messages with sign_interval=4. After msg 4, a periodic
+     * signature covers seq 1-4. Messages 5-6 remain unsigned.
+     * mmhashchainsigs_final_sign must produce a signature covering
+     * seq 5-6. The verifier in strict mode must pass.
+     */
+    mmhashchainsigs_instance_t inst = {
+        .privkey_path = privkey_path,
+        .sign_interval = 4,
+    };
+    mmhashchainsigs_worker_t wrkr = {
+        .inst = &inst,
+        .initialized = 0,
+    };
+
+    verifier_ctx_t vctx;
+    assert(verifier_init(&vctx, pubkey_path, 1) == 0);
+
+    char lines[7][8192];
+    size_t line_lens[7];
+    int line_count = 0;
+
+    for (int i = 0; i < 6; i++) {
+        char msg[128];
+        int mlen = snprintf(msg, sizeof(msg), "message %d", i);
+
+        char sd[HCS_SD_MAX_LEN];
+        int sd_len = mmhashchainsigs_process_msg(
+            &wrkr, msg, (size_t)mlen, sd, sizeof(sd));
+        assert(sd_len > 0);
+
+        int llen = snprintf(lines[line_count], sizeof(lines[0]),
+                            "%s%s", sd, msg);
+        assert(llen > 0);
+        line_lens[line_count] = (size_t)llen;
+        line_count++;
+    }
+
+    /* Emit the final signature — should cover the unsigned tail */
+    char final_sd[HCS_SD_MAX_LEN];
+    int final_len = mmhashchainsigs_final_sign(
+        &wrkr, final_sd, sizeof(final_sd));
+    assert(final_len > 0);
+
+    /* The final signature is a standalone SD line (no message body).
+     * Feed it to the verifier as a line consisting of just the SD. */
+    memcpy(lines[line_count], final_sd, (size_t)final_len);
+    line_lens[line_count] = (size_t)final_len;
+    line_count++;
+
+    for (int i = 0; i < line_count; i++) {
+        assert(verifier_process_line(
+            &vctx, lines[i], line_lens[i],
+            (uint64_t)(i + 1)) == 0);
+    }
+
+    verifier_finalize(&vctx);
+
+    if (!verifier_passed(&vctx)) {
+        for (int i = 0; i < vctx.error_count; i++) {
+            fprintf(stderr, "  error: %s\n",
+                    vctx.errors[i].message);
+        }
+    }
+    assert(verifier_passed(&vctx));
+    /* 6 real messages + 1 empty-payload final sign entry */
+    assert(vctx.msg_count == 7);
+    assert(vctx.sig_count == 2);
+
+    verifier_free(&vctx);
+    mmhashchainsigs_free(&wrkr);
+    printf("  PASS: test_final_sign_covers_tail\n");
+}
+
+static void test_final_sign_no_unsigned(void)
+{
+    /*
+     * Process exactly sign_interval messages so the periodic signature
+     * covers all of them. mmhashchainsigs_final_sign must return 0
+     * (nothing to sign).
+     */
+    mmhashchainsigs_instance_t inst = {
+        .privkey_path = privkey_path,
+        .sign_interval = 4,
+    };
+    mmhashchainsigs_worker_t wrkr = {
+        .inst = &inst,
+        .initialized = 0,
+    };
+
+    for (int i = 0; i < 4; i++) {
+        char msg[128];
+        int mlen = snprintf(msg, sizeof(msg), "message %d", i);
+        char sd[HCS_SD_MAX_LEN];
+        int sd_len = mmhashchainsigs_process_msg(
+            &wrkr, msg, (size_t)mlen, sd, sizeof(sd));
+        assert(sd_len > 0);
+    }
+
+    /* INIT(1) + MSG(2) + MSG(3) + SIG(4) → msg_count reset to 0 */
+    char final_sd[HCS_SD_MAX_LEN];
+    int final_len = mmhashchainsigs_final_sign(
+        &wrkr, final_sd, sizeof(final_sd));
+    assert(final_len == 0);
+
+    mmhashchainsigs_free(&wrkr);
+    printf("  PASS: test_final_sign_no_unsigned\n");
+}
+
+static void test_state_save_load_roundtrip(void)
+{
+    mmhashchainsigs_instance_t inst = {
+        .privkey_path = privkey_path,
+        .sign_interval = 4,
+    };
+    mmhashchainsigs_worker_t wrkr = {
+        .inst = &inst,
+        .initialized = 0,
+        .pending_state = NULL,
+    };
+
+    for (int i = 0; i < 6; i++) {
+        char msg[128];
+        int mlen = snprintf(msg, sizeof(msg), "message %d", i);
+        char sd[HCS_SD_MAX_LEN];
+        int sd_len = mmhashchainsigs_process_msg(
+            &wrkr, msg, (size_t)mlen, sd, sizeof(sd));
+        assert(sd_len > 0);
+    }
+
+    char tmpdir[] = "/tmp/hcs_state_XXXXXX";
+    assert(mkdtemp(tmpdir) != NULL);
+
+    int saved = mmhashchainsigs_save_state(&wrkr, tmpdir);
+    assert(saved == 1);
+
+    mmhashchainsigs_saved_state_t *st =
+        mmhashchainsigs_load_state(tmpdir);
+    assert(st != NULL);
+
+    assert(memcmp(st->chain_hash, wrkr.chain.current,
+                  HCS_HASH_LEN) == 0);
+    assert(st->seq == wrkr.chain.seq);
+    assert(st->sig_seq_from == wrkr.sig_seq_from);
+    assert(memcmp(st->pubkey_fp,
+                  signer_pubkey_fp(&wrkr.signer),
+                  HCS_HASH_LEN) == 0);
+
+    free(st);
+    mmhashchainsigs_delete_state(tmpdir);
+    rmdir(tmpdir);
+    mmhashchainsigs_free(&wrkr);
+    printf("  PASS: test_state_save_load_roundtrip\n");
+}
+
+static void test_state_inject_and_verify(void)
+{
+    /*
+     * Simulate graceful shutdown + restart:
+     * 1. Process 6 msgs (sign_interval=4 → SIG at msg 4, 2 unsigned)
+     * 2. Save state
+     * 3. New worker loads state
+     * 4. First msg gets final SIG from old chain
+     * 5. Next msgs start a new chain (INIT + MSG + MSG + SIG)
+     * 6. Verify the entire log in strict mode
+     */
+    mmhashchainsigs_instance_t inst = {
+        .privkey_path = privkey_path,
+        .sign_interval = 4,
+        .statefiledir = NULL,
+    };
+
+    char tmpdir[] = "/tmp/hcs_state_XXXXXX";
+    assert(mkdtemp(tmpdir) != NULL);
+    inst.statefiledir = tmpdir;
+
+    mmhashchainsigs_worker_t wrkr1 = {
+        .inst = &inst,
+        .initialized = 0,
+        .pending_state = NULL,
+    };
+
+    char lines[20][8192];
+    size_t line_lens[20];
+    int lc = 0;
+
+    /* Phase 1: original chain — 6 messages */
+    for (int i = 0; i < 6; i++) {
+        char msg[128];
+        int mlen = snprintf(msg, sizeof(msg),
+                            "original %d", i);
+        char sd[HCS_SD_MAX_LEN];
+        int sd_len = mmhashchainsigs_process_msg(
+            &wrkr1, msg, (size_t)mlen,
+            sd, sizeof(sd));
+        assert(sd_len > 0);
+        int n = snprintf(lines[lc], sizeof(lines[0]),
+                         "%s%s", sd, msg);
+        assert(n > 0);
+        line_lens[lc] = (size_t)n;
+        lc++;
+    }
+
+    assert(mmhashchainsigs_save_state(&wrkr1, tmpdir) == 1);
+    mmhashchainsigs_free(&wrkr1);
+
+    /* Phase 2: new worker with loaded state — 5 messages
+     * (final SIG + INIT + MSG + MSG + periodic SIG) */
+    mmhashchainsigs_worker_t wrkr2 = {
+        .inst = &inst,
+        .initialized = 0,
+        .pending_state = mmhashchainsigs_load_state(tmpdir),
+    };
+    assert(wrkr2.pending_state != NULL);
+
+    for (int i = 0; i < 5; i++) {
+        char msg[128];
+        int mlen = snprintf(msg, sizeof(msg),
+                            "restart %d", i);
+        char sd[HCS_SD_MAX_LEN];
+        int sd_len = mmhashchainsigs_process_msg(
+            &wrkr2, msg, (size_t)mlen,
+            sd, sizeof(sd));
+        assert(sd_len > 0);
+        int n = snprintf(lines[lc], sizeof(lines[0]),
+                         "%s%s", sd, msg);
+        assert(n > 0);
+        line_lens[lc] = (size_t)n;
+        lc++;
+    }
+
+    /* State file should be deleted after consumption */
+    assert(mmhashchainsigs_load_state(tmpdir) == NULL);
+    rmdir(tmpdir);
+    inst.statefiledir = NULL;
+
+    /* Verify the full 11-line log in strict mode */
+    verifier_ctx_t vctx;
+    assert(verifier_init(&vctx, pubkey_path, 1) == 0);
+
+    for (int i = 0; i < lc; i++) {
+        int r = verifier_process_line(
+            &vctx, lines[i], line_lens[i],
+            (uint64_t)(i + 1));
+        assert(r == 0);
+    }
+
+    verifier_finalize(&vctx);
+    if (!verifier_passed(&vctx)) {
+        for (int i = 0; i < vctx.error_count; i++) {
+            fprintf(stderr, "  error line %lu: %s\n",
+                    (unsigned long)vctx.errors[i].line_num,
+                    vctx.errors[i].message);
+        }
+    }
+    assert(verifier_passed(&vctx));
+    assert(vctx.msg_count == 11);
+    assert(vctx.sig_count == 3);
+    assert(vctx.segment_count == 2);
+
+    verifier_free(&vctx);
+    mmhashchainsigs_free(&wrkr2);
+    printf("  PASS: test_state_inject_and_verify\n");
+}
+
+static void test_state_no_unsigned(void)
+{
+    /* When all messages are signed (msg_count=0), save_state
+     * should return 0 and not create a state file. */
+    mmhashchainsigs_instance_t inst = {
+        .privkey_path = privkey_path,
+        .sign_interval = 4,
+    };
+    mmhashchainsigs_worker_t wrkr = {
+        .inst = &inst,
+        .initialized = 0,
+        .pending_state = NULL,
+    };
+
+    for (int i = 0; i < 4; i++) {
+        char msg[128];
+        int mlen = snprintf(msg, sizeof(msg), "msg %d", i);
+        char sd[HCS_SD_MAX_LEN];
+        mmhashchainsigs_process_msg(
+            &wrkr, msg, (size_t)mlen, sd, sizeof(sd));
+    }
+
+    char tmpdir[] = "/tmp/hcs_state_XXXXXX";
+    assert(mkdtemp(tmpdir) != NULL);
+    assert(mmhashchainsigs_save_state(&wrkr, tmpdir) == 0);
+    assert(mmhashchainsigs_load_state(tmpdir) == NULL);
+    rmdir(tmpdir);
+
+    mmhashchainsigs_free(&wrkr);
+    printf("  PASS: test_state_no_unsigned\n");
+}
+
+static void test_final_sign_uninitialized(void)
+{
+    /*
+     * A worker that never processed a message should return 0.
+     */
+    mmhashchainsigs_instance_t inst = {
+        .privkey_path = privkey_path,
+        .sign_interval = 4,
+    };
+    mmhashchainsigs_worker_t wrkr = {
+        .inst = &inst,
+        .initialized = 0,
+    };
+
+    char final_sd[HCS_SD_MAX_LEN];
+    int final_len = mmhashchainsigs_final_sign(
+        &wrkr, final_sd, sizeof(final_sd));
+    assert(final_len == 0);
+
+    mmhashchainsigs_free(&wrkr);
+    printf("  PASS: test_final_sign_uninitialized\n");
+}
+
 int main(void)
 {
     printf("test_mmhashchainsigs:\n");
@@ -813,6 +1135,12 @@ int main(void)
     test_hdr_chain_verify();
     test_hdr_tamper_detect();
     test_hdr_collision();
+    test_final_sign_covers_tail();
+    test_final_sign_no_unsigned();
+    test_final_sign_uninitialized();
+    test_state_save_load_roundtrip();
+    test_state_inject_and_verify();
+    test_state_no_unsigned();
 
     cleanup_test_keys();
 

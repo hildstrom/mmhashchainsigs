@@ -489,6 +489,147 @@ start_rsyslog_no_unix_sock() {
     die "rsyslogd did not create socket $wait_path"
 }
 
+# --- Test: statefiledir shutdown+restart produces final signature ---
+test_statefiledir_restart() {
+    local logfile="$TMPDIR_BASE/statefiledir-restart.log"
+    local statedir="$TMPDIR_BASE/statefiledir-restart"
+    local conf="$TMPDIR_BASE/statefiledir-restart.conf"
+    mkdir -p "$statedir"
+
+    cat > "$conf" <<EOF
+global(workDirectory="$TMPDIR_BASE")
+
+module(load="imuxsock" SysSock.Use="off")
+input(type="imuxsock" Socket="$SOCK")
+module(load="$MMHASHCHAINSIGS_SO")
+
+template(name="sd-preserve" type="string"
+    string="%STRUCTURED-DATA%%msg%\n")
+
+*.* {
+    action(
+        type="mmhashchainsigs"
+        privatekey="$TMPDIR_BASE/privkey.pem"
+        signinterval="10"
+        statefiledir="$statedir"
+    )
+    action(
+        type="omfile"
+        file="$logfile"
+        template="sd-preserve"
+    )
+}
+EOF
+
+    # Phase 1: send 15 messages (SIG at 10, leaves 5 unsigned),
+    # then gracefully stop rsyslog.
+    start_rsyslog "$conf"
+    "$SENDER" "$SOCK" "mmhcs-state" 15
+    sleep "$DRAIN_PAUSE"
+    stop_rsyslog
+
+    if [ ! -f "$logfile" ]; then
+        echo "    logfile not created after phase 1" >&2
+        cat "$TMPDIR_BASE/rsyslog.err" >&2
+        report "statefiledir_restart" 1
+        return
+    fi
+
+    # State file must exist after graceful shutdown.
+    if [ ! -f "$statedir/mmhashchainsigs.state" ]; then
+        echo "    state file not written on shutdown" >&2
+        report "statefiledir_restart" 1
+        return
+    fi
+
+    # Phase 2: restart rsyslog with the same config and log file.
+    # The first message consumes the state file (final SIG for the
+    # old chain), so send signinterval+1 = 11 messages: 1 for the
+    # final SIG + 10 for the new chain's periodic SIG.
+    start_rsyslog "$conf"
+    "$SENDER" "$SOCK" "mmhcs-state2" 11
+    sleep "$DRAIN_PAUSE"
+    stop_rsyslog
+
+    # State file should have been consumed (deleted) on startup.
+    # A new one may exist if the second run has an unsigned tail,
+    # but verify the OLD one was consumed by checking the log.
+
+    # The full log must pass strict verification: the final
+    # signature from the old chain covered the unsigned tail,
+    # and the new chain's periodic SIG covers its messages.
+    local out
+    out=$("$VERIFY" -k "$TMPDIR_BASE/pubkey.pem" -s "$logfile" 2>&1) \
+        && report "statefiledir_restart" 0 \
+        || { echo "    verify failed: $out" >&2
+             report "statefiledir_restart" 1; }
+}
+
+# --- Test: without statefiledir, strict mode detects unsigned tail ---
+test_no_statefiledir_strict() {
+    local logfile="$TMPDIR_BASE/no-statefiledir.log"
+    local conf="$TMPDIR_BASE/no-statefiledir.conf"
+
+    cat > "$conf" <<EOF
+global(workDirectory="$TMPDIR_BASE")
+
+module(load="imuxsock" SysSock.Use="off")
+input(type="imuxsock" Socket="$SOCK")
+module(load="$MMHASHCHAINSIGS_SO")
+
+template(name="sd-preserve" type="string"
+    string="%STRUCTURED-DATA%%msg%\n")
+
+*.* {
+    action(
+        type="mmhashchainsigs"
+        privatekey="$TMPDIR_BASE/privkey.pem"
+        signinterval="10"
+    )
+    action(
+        type="omfile"
+        file="$logfile"
+        template="sd-preserve"
+    )
+}
+EOF
+
+    # Phase 1: send 15 messages (SIG at 10, 5 unsigned), stop.
+    start_rsyslog "$conf"
+    "$SENDER" "$SOCK" "mmhcs-nostate" 15
+    sleep "$DRAIN_PAUSE"
+    stop_rsyslog
+
+    if [ ! -f "$logfile" ]; then
+        report "no_statefiledir_strict" 1
+        return
+    fi
+
+    # Phase 2: restart and send 10 more.
+    start_rsyslog "$conf"
+    "$SENDER" "$SOCK" "mmhcs-nostate2" 10
+    sleep "$DRAIN_PAUSE"
+    stop_rsyslog
+
+    # Non-strict should pass (chain integrity is intact).
+    local non_strict
+    "$VERIFY" -k "$TMPDIR_BASE/pubkey.pem" "$logfile" \
+        >/dev/null 2>&1 && non_strict=0 || non_strict=$?
+
+    # Strict should FAIL (unsigned tail from phase 1).
+    local strict
+    "$VERIFY" -k "$TMPDIR_BASE/pubkey.pem" -s "$logfile" \
+        >/dev/null 2>&1 && strict=0 || strict=$?
+
+    if [ "$non_strict" -eq 0 ] && [ "$strict" -ne 0 ]; then
+        report "no_statefiledir_strict" 0
+    else
+        echo "    non-strict=$non_strict strict=$strict" \
+             "(expected 0, !0)" >&2
+        report "no_statefiledir_strict" 1
+    fi
+}
+
 # --- Main ---
 main() {
     echo "=== mmhashchainsigs integration tests ==="
@@ -502,6 +643,8 @@ main() {
     test_rfc5424_collision
     test_rfc5424_header_capture
     test_rfc5424_header_tamper
+    test_statefiledir_restart
+    test_no_statefiledir_strict
 
     echo ""
     echo "=== Results: $PASS passed, $FAIL failed ==="

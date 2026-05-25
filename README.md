@@ -127,6 +127,7 @@ template(name="sd-preserve" type="string"
         type="mmhashchainsigs"
         privatekey="/etc/rsyslog.d/mmhashchainsigs-private.pem"
         signinterval="1024"
+        statefiledir="/var/lib/mmhashchainsigs"
     )
     action(type="omrelp" target="logserver" port="514")
     action(
@@ -207,7 +208,7 @@ message:
 |-------|------|--------|
 | INIT  | First message of a chain | `t="I"`, `q` (seq), `h` (chain hash), `f` (pubkey fingerprint) |
 | MSG   | Ordinary message         | `q`, `h` |
-| SIG   | Every `signinterval` messages | `t="S"`, `q`, `h`, `qf` (first signed seq), `qt` (last signed seq), `s` (Ed25519 signature, base64) |
+| SIG   | Every `signinterval` messages, and on graceful shutdown | `t="S"`, `q`, `h`, `qf` (first signed seq), `qt` (last signed seq), `s` (Ed25519 signature, base64) |
 
 ### Header capture element
 
@@ -275,6 +276,15 @@ public key.
 | `privatekey` | string | (required) | Path to Ed25519 private key PEM |
 | `template` | string | rsyslog default | Rsyslog template for hash input |
 | `signinterval` | integer | 1024 | Sign every N messages |
+| `statefiledir` | string | (none) | Directory for shutdown state file; enables final signature on graceful restart |
+
+**Single worker thread required.** The hash chain is inherently sequential
+-- each message's hash depends on the previous one. If rsyslog's action
+queue creates multiple worker threads, messages are distributed across
+workers non-deterministically, producing interleaved independent chains
+that the verifier cannot reconstruct. The module rejects a second worker
+at startup with an error message. Do not set `queue.workerThreads` >1 on
+the mmhashchainsigs action (the default of 1 is correct).
 
 ## Module Interface
 
@@ -295,6 +305,62 @@ RuleEngine so the modification happens before subsequent `omrelp` /
 The parser interface is intended for modules that convert raw octet
 streams into parsed `smsg_t` structures during ingest, which is a poor fit
 for adding signature metadata to messages that are already parsed.
+
+## Shutdown and Crash Behavior
+
+### Graceful shutdown with `statefiledir`
+
+When `statefiledir` is configured, mmhashchainsigs saves the hash chain
+state (current hash, sequence number, signing range, and public key
+fingerprint) to a file on graceful shutdown. On the next startup, the
+module reads the state file and uses it to sign the first arriving message
+through the **restored old chain** before starting a new chain. This means:
+
+- The first message after restart carries a SIG SD element that covers all
+  previously unsigned messages from the old chain, plus the message itself.
+- The second message carries a normal INIT SD element for the new chain.
+- No messages are sacrificed -- every message's content is
+  integrity-protected.
+- The state file is deleted after it is consumed.
+- The verifier sees a seamless transition: the old chain is fully signed,
+  and the new chain begins immediately after.
+
+The state file is written atomically (write to temp file, then `rename(2)`)
+to the configured directory as `mmhashchainsigs.state`.
+
+If the private key changed between restarts, the saved state's public key
+fingerprint will not match the new key. In that case, the state file is
+discarded and the first message starts a fresh chain with INIT as usual.
+
+If `statefiledir` is not configured, no state is saved and the module
+behaves as if there was no previous chain -- the first message after
+restart always gets a new INIT.
+
+### Crash or hard poweroff
+
+If rsyslog is killed (`SIGKILL`), the system loses power, or the process
+crashes, no state file is written. The consequences:
+
+- **Hash chain integrity is preserved.** Every message in the audit log
+  carries its own `q=` (sequence) and `h=` (chain hash) in the structured
+  data. The verifier can reconstruct and validate the hash chain for all
+  stored messages, detecting any tampering, deletion, or reordering.
+- **Signature coverage has a gap.** Messages after the last periodic
+  signature lack cryptographic non-repudiation. At most `signinterval`
+  messages (default 1024) are unsigned.
+- **A new chain starts on restart.** When rsyslog restarts, the module
+  initializes a fresh hash chain with a new INIT record (`t="I"`). The
+  verifier handles this: it accepts multiple segments in a single log file,
+  each starting with an INIT record.
+- **Detection in strict mode.** Running `mmhashchainsigs-verify --strict`
+  reports the unsigned tail: `"N messages at tail are unsigned"` for the
+  segment that ended without a final signature, and
+  `"N messages unsigned before new segment"` when a new INIT follows an
+  unsigned tail.
+
+To minimize the window of unsigned messages after a crash, reduce
+`signinterval`. A value of 1 signs every message (no unsigned tail) at the
+cost of one Ed25519 signature per message instead of one per N messages.
 
 ## Security Properties
 

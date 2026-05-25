@@ -60,4 +60,21 @@ Engine -> Omfile : enriched smsg_t
 Omfile -> Omfile : render template\n"%STRUCTURED-DATA%%msg%\\n"
 Omfile -> File : write("[mmhashchainsigs@32473 ...]\n[mmhashchainsigs-hdr@32473 ...]\n[cleaned_client_SD]MSG\\n")
 
+== Graceful shutdown (statefiledir configured) ==
+
+MMHCS -> MMHCS : freeWrkrInstance()\nif msg_count > 0:\n  save_state(chain_hash,\n    seq, sig_seq_from,\n    pubkey_fp)
+MMHCS -> File : write state to\nstatefiledir/mmhashchainsigs.state
+
+== Next startup — first message ==
+
+note over MMHCS
+  createWrkrInstance() loads
+  the saved state file.
+  First doAction() restores the
+  old chain, hashes the message
+  through it, signs, emits SIG.
+  Then reinitializes for a new chain.
+  Second message gets INIT.
+end note
+
 @enduml
