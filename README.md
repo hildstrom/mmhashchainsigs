@@ -3,10 +3,11 @@
 Cryptographic integrity for syslog records carried over RELP.
 
 `mmhashchainsigs` is an rsyslog message-modification module that attaches
-a SHA-256 hash chain and periodic Ed25519 signatures to every message as
-RFC 5424 structured data. The receiver stores the messages as delivered
-and uses the companion `mmhashchainsigs-verify` tool to detect tampering,
-deletion, insertion, or reordering of records.
+a SHA-256 hash chain and periodic signatures (Ed25519 or ECDSA P-256) to
+every message as RFC 5424 structured data. Keys may be supplied as raw
+PEM or wrapped in an X.509 certificate. The receiver stores the messages
+as delivered and uses the companion `mmhashchainsigs-verify` tool to
+detect tampering, deletion, insertion, or reordering of records.
 
 See [docs/STRUCTURE.md](docs/STRUCTURE.md) for the source layout,
 [docs/BENCHMARK.md](docs/BENCHMARK.md) for throughput numbers, and
@@ -54,6 +55,19 @@ mmhashchainsigs uses Ed25519 (asymmetric) signatures so only the signing host
 holds the private key, chains messages with SHA-256 so any modification,
 deletion, insertion, or reorder breaks the chain at the point of damage,
 and uses sequence numbers so gaps and replays are explicit.
+
+## Trust Modes
+
+Three ways to convey signer identity to the verifier:
+
+| Mode | Signer config | Verifier flag | When to use |
+|------|---------------|---------------|-------------|
+| Raw key | `privatekey=key.pem` | `--publickey pub.pem` | Fastest, smallest log overhead. Distribute the public key out of band. |
+| Pinned X.509 cert | `privatekey=key.pem` `certificate=cert.pem` | `--cert cert.pem` | You want an X.509 envelope (audit policy, future PKI rollout) but no chain validation. Verifier pins the leaf. Cert validity dates are not enforced. |
+| CA-validated cert | `privatekey=key.pem` `certificate=cert.pem` `embedcert=on` | `--ca-bundle ca.pem` [`--crl-file crl.pem`] | Standard PKI deployment. Operators rotate certs through their CA; verifiers only need the CA bundle. Cert chain is validated on every chain INIT line. |
+
+Ed25519 and ECDSA P-256 are interchangeable across all three modes — pick
+one per signing host. See [docs/X509.md](docs/X509.md) for the full design.
 
 ## How It Works
 
@@ -105,14 +119,34 @@ make bench
 
 ### Generate Keys
 
+Raw key pair (default — fastest, smallest log overhead):
+
 ```sh
 mkdir -p /etc/rsyslog.d
-tools/mmhashchainsigs-keygen.sh /etc/rsyslog.d
+tools/mmhashchainsigs-keygen.sh keygen --outdir /etc/rsyslog.d
 ```
 
-This produces:
+Produces:
 - `mmhashchainsigs-private.pem` -- deploy to the signing host (mode 0600)
-- `mmhashchainsigs-public.pem` -- distribute to anyone who needs to verify logs
+- `mmhashchainsigs-public.pem` -- distribute to verifiers
+
+X.509 self-signed certificate (use with `--cert` at the verifier):
+
+```sh
+tools/mmhashchainsigs-keygen.sh selfsign --alg ed25519 \
+    --cn my-host.example.com --days 365 --outdir /etc/rsyslog.d
+```
+
+X.509 CSR for an external CA to sign:
+
+```sh
+tools/mmhashchainsigs-keygen.sh csr --alg ecdsa-p256 \
+    --cn my-host.example.com --outdir /etc/rsyslog.d
+# Submit mmhashchainsigs.csr to your CA, install the issued cert as
+# /etc/rsyslog.d/mmhashchainsigs-cert.pem
+```
+
+Supported algorithms: `ed25519` (default) and `ecdsa-p256`.
 
 ### Configure rsyslog
 
@@ -161,9 +195,18 @@ FAIL: 1 error(s) detected
 ### CLI Options
 
 ```
-mmhashchainsigs-verify -k <pubkey.pem> [OPTIONS] <logfile>
+mmhashchainsigs-verify (-k <pubkey.pem> | -c <cert.pem> | -C <ca.pem>) \
+                      [OPTIONS] <logfile>
 
-  -k, --publickey <path>  Path to Ed25519 public key (required)
+Trust anchor (exactly one is required):
+  -k, --publickey <path>  Raw PEM public key (Ed25519 or ECDSA P-256)
+  -c, --cert <path>       Pinned X.509 leaf certificate PEM
+  -C, --ca-bundle <path>  PEM bundle of CA certificates; the signer's
+                          cert must be embedded in the log (embedcert=on)
+                          and chain to a CA in this bundle
+      --crl-file <path>   Optional CRL file (only with --ca-bundle)
+
+Options:
   -v, --verbose           Print per-block verification details
   -q, --quiet             Only output final pass/fail
   -s, --strict            Fail if the file does not end with a signature
@@ -174,6 +217,7 @@ Exit codes:
   1  Verification failure (integrity violation detected)
   2  Usage error or file not found
   3  Public key fingerprint mismatch
+  4  Certificate chain validation failure
 ```
 
 ### Install
@@ -273,7 +317,9 @@ public key.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `privatekey` | string | (required) | Path to Ed25519 private key PEM |
+| `privatekey` | string | (required) | Path to private key PEM (Ed25519 or ECDSA P-256) |
+| `certificate` | string | (none) | Optional X.509 cert PEM matching the private key. When set, the cert's public key drives the on-wire fingerprint. |
+| `embedcert` | binary | off | Emit the X.509 cert in `[mmhashchainsigs-cert@32473 ...]` on chain INIT lines so verifiers in CA-bundle mode can chain-validate without out-of-band cert distribution. Requires `certificate=`. |
 | `template` | string | rsyslog default | Rsyslog template for hash input |
 | `signinterval` | integer | 1024 | Sign every N messages |
 | `statefiledir` | string | (none) | Directory for shutdown state file; enables final signature on graceful restart |

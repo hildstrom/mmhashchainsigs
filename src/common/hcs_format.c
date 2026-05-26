@@ -133,6 +133,109 @@ int hcs_format_sd_sig(
     return n;
 }
 
+int hcs_format_sd_cert(
+    const unsigned char *der, size_t der_len,
+    char *buf, size_t buf_len)
+{
+    if (der_len > HCS_CERT_DER_MAX) return -1;
+
+    /* Worst-case b64 size for HCS_CERT_DER_MAX: ceil(4096/3)*4 = 5464.
+     * We allocate dynamically rather than on the stack so the size is
+     * proportional to der_len. */
+    size_t b64_cap = ((der_len + 2) / 3) * 4 + 4;
+    char *b64 = malloc(b64_cap);
+    if (!b64) return -1;
+    if (hcs_b64_encode(der, der_len, b64, b64_cap) < 0) {
+        free(b64);
+        return -1;
+    }
+    int n = snprintf(buf, buf_len,
+        "[%s cert=\"%s\"]", HCS_SD_CERT_ID, b64);
+    free(b64);
+    if (n < 0 || (size_t)n >= buf_len) return -1;
+    return n;
+}
+
+int hcs_extract_and_strip_cert_sd(
+    const char *src, size_t src_len,
+    char *msg_buf, size_t msg_buf_cap,
+    int *msg_len_out,
+    unsigned char *der_out, size_t *der_len)
+{
+    char prefix[64];
+    int plen_signed = snprintf(
+        prefix, sizeof(prefix), "[%s ", HCS_SD_CERT_ID);
+    if (plen_signed < 0 || (size_t)plen_signed >= sizeof(prefix)) {
+        return -1;
+    }
+    size_t plen = (size_t)plen_signed;
+
+    const char *sd_start = NULL;
+    for (size_t i = 0; i + plen <= src_len; i++) {
+        if (memcmp(src + i, prefix, plen) == 0) {
+            sd_start = src + i;
+            break;
+        }
+    }
+    if (!sd_start) {
+        /* No cert SD: copy through. */
+        if (src_len >= msg_buf_cap) return -1;
+        if (src != msg_buf) {
+            memmove(msg_buf, src, src_len);
+        }
+        msg_buf[src_len] = '\0';
+        *msg_len_out = (int)src_len;
+        *der_len = 0;
+        return 0;
+    }
+
+    /* Find the cert="..." value. */
+    const char *p = sd_start + plen;
+    const char *end = src + src_len;
+
+    static const char key[] = "cert=\"";
+    size_t klen = sizeof(key) - 1;
+    if (p + klen >= end || memcmp(p, key, klen) != 0) {
+        return -1;
+    }
+    const char *vstart = p + klen;
+    const char *vend = vstart;
+    while (vend < end && *vend != '"') {
+        if (*vend == '\\' && vend + 1 < end) vend++;
+        vend++;
+    }
+    if (vend >= end || vend[0] != '"' || vend + 1 >= end || vend[1] != ']') {
+        return -1;
+    }
+
+    size_t b64_len = (size_t)(vend - vstart);
+    size_t cert_sd_len = (size_t)((vend + 2) - sd_start);
+
+    /* Decode DER. */
+    size_t der_cap = *der_len;
+    *der_len = der_cap;
+    if (hcs_b64_decode(vstart, b64_len, der_out, der_len) != 0) {
+        return -1;
+    }
+
+    /* Strip the cert SD from src into msg_buf (handle in-place). */
+    size_t before = (size_t)(sd_start - src);
+    size_t after = src_len - before - cert_sd_len;
+    size_t total = before + after;
+    if (total >= msg_buf_cap) return -1;
+
+    if (msg_buf != src) {
+        memcpy(msg_buf, src, before);
+        memcpy(msg_buf + before, sd_start + cert_sd_len, after);
+    } else {
+        /* In-place: shift the tail down. */
+        memmove(msg_buf + before, sd_start + cert_sd_len, after);
+    }
+    msg_buf[total] = '\0';
+    *msg_len_out = (int)total;
+    return 1;
+}
+
 int hcs_format_sd_continue(
     uint64_t seq,
     const unsigned char chain_hash[HCS_HASH_LEN],

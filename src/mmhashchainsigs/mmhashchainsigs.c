@@ -18,8 +18,16 @@
 
 int mmhashchainsigs_init(mmhashchainsigs_worker_t *wrkr)
 {
-    if (signer_init(&wrkr->signer,
-                    wrkr->inst->privkey_path) != 0) {
+    int rc;
+    if (wrkr->inst->cert_path) {
+        rc = signer_init_x509(&wrkr->signer,
+                              wrkr->inst->privkey_path,
+                              wrkr->inst->cert_path);
+    } else {
+        rc = signer_init(&wrkr->signer,
+                         wrkr->inst->privkey_path);
+    }
+    if (rc != 0) {
         return -1;
     }
     if (hashchain_init(&wrkr->chain) != 0) {
@@ -66,12 +74,14 @@ int mmhashchainsigs_process_msg(
     uint64_t seq = wrkr->chain.seq - 1;
     int sd_len;
 
+    bool emit_cert = false;
     if (wrkr->is_first) {
         sd_len = hcs_format_sd_init(
             seq, wrkr->chain.current,
             signer_pubkey_fp(&wrkr->signer),
             sd_buf, sd_buf_len);
         wrkr->is_first = 0;
+        emit_cert = true;
     } else if (wrkr->chain.msg_count
                >= wrkr->inst->sign_interval) {
         unsigned char sig[HCS_SIG_MAX_LEN];
@@ -93,6 +103,32 @@ int mmhashchainsigs_process_msg(
         sd_len = hcs_format_sd_msg(
             seq, wrkr->chain.current,
             sd_buf, sd_buf_len);
+    }
+
+    if (sd_len < 0) {
+        return -1;
+    }
+
+    /* If embedcert is enabled and this frame opens (or re-opens) a
+     * chain, append the cert SD so CA-bundle verifiers can chain-
+     * validate without out-of-band cert distribution. The cert SD is
+     * NOT part of the hashed payload — verifiers strip it before hashing. */
+    if (emit_cert && wrkr->inst->embedcert) {
+        const unsigned char *der = NULL;
+        int der_len = 0;
+        if (signer_get_cert_der(&wrkr->signer, &der, &der_len) == 0) {
+            int rem = (int)sd_buf_len - sd_len;
+            int n = hcs_format_sd_cert(
+                der, (size_t)der_len,
+                sd_buf + sd_len, (size_t)rem);
+            if (n > 0) {
+                sd_len += n;
+            }
+            /* If formatting fails, fall through: the main SD already
+             * succeeded, and the verifier will report a missing-cert
+             * error rather than the writer silently producing a half-
+             * configured frame. */
+        }
     }
 
     return sd_len;
@@ -372,6 +408,8 @@ typedef struct wrkrInstanceData {
 
 static struct cnfparamdescr actpdescr[] = {
     { "privatekey",    eCmdHdlrString,      CNFPARAM_REQUIRED },
+    { "certificate",   eCmdHdlrString,      0 },
+    { "embedcert",     eCmdHdlrBinary,      0 },
     { "template",      eCmdHdlrString,      0 },
     { "signinterval",  eCmdHdlrPositiveInt,  0 },
     { "statefiledir",  eCmdHdlrString,      0 },
@@ -413,6 +451,7 @@ ENDcreateWrkrInstance
 BEGINfreeInstance
 CODESTARTfreeInstance
     free(pData->inst.privkey_path);
+    free(pData->inst.cert_path);
     free(pData->inst.tpl_name);
     free(pData->inst.statefiledir);
 ENDfreeInstance
@@ -451,6 +490,14 @@ CODESTARTnewActInst
             pData->inst.privkey_path =
                 (char *)es_str2cstr(pvals[i].val.d.estr,
                                     NULL);
+        } else if (!strcmp(actpblk.descr[i].name,
+                           "certificate")) {
+            pData->inst.cert_path =
+                (char *)es_str2cstr(pvals[i].val.d.estr,
+                                    NULL);
+        } else if (!strcmp(actpblk.descr[i].name,
+                           "embedcert")) {
+            pData->inst.embedcert = (int)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name,
                            "template")) {
             pData->inst.tpl_name =
@@ -575,7 +622,7 @@ CODESTARTdoAction
         memcpy(payload + cleaned_len, msg, msg_len);
     }
 
-    char sd[HCS_SD_MAX_LEN];
+    char sd[HCS_SD_WITH_CERT_MAX_LEN];
     int sd_len = mmhashchainsigs_process_msg(
         &pWrkrData->wrkr, payload, payload_len,
         sd, sizeof(sd));

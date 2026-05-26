@@ -19,8 +19,12 @@
 /* Hex-encoded SHA-256 hash: 64 chars + NUL */
 #define HCS_HEX_HASH_LEN (HCS_HASH_LEN * 2)
 
-/* Base64-encoded Ed25519 signature (64 bytes -> 88 chars + NUL) */
-#define HCS_B64_SIG_LEN 88
+/* Base64-encoded signature, sized to cover HCS_SIG_MAX_LEN (80 bytes):
+ *   Ed25519 (64B)     -> 88 chars
+ *   ECDSA P-256 (72B) -> 96 chars
+ *   ceil(80 / 3) * 4  = 108 chars
+ * Round up for safety. */
+#define HCS_B64_SIG_LEN 112
 
 /*
  * Compute the well-known chain initialization hash:
@@ -58,9 +62,16 @@ int hcs_b64_decode(
 
 #define HCS_SD_ID      "mmhashchainsigs@32473"
 #define HCS_SD_HDR_ID  "mmhashchainsigs-hdr@32473"
+#define HCS_SD_CERT_ID "mmhashchainsigs-cert@32473"
 #define HCS_SD_MAX_LEN 384
 /* Larger because escaped host/app/procid/msgid values can be long. */
 #define HCS_SD_HDR_MAX_LEN 1024
+/* Sized to hold base64 of a CA-issued cert (~1500 bytes DER -> ~2000 b64). */
+#define HCS_SD_CERT_MAX_LEN 3072
+/* Total output SD buffer for the chain-metadata + optional cert SD. */
+#define HCS_SD_WITH_CERT_MAX_LEN (HCS_SD_MAX_LEN + HCS_SD_CERT_MAX_LEN)
+/* Max DER cert size we will accept. */
+#define HCS_CERT_DER_MAX 4096
 
 typedef enum {
     HCS_SD_MSG      = 0,
@@ -125,6 +136,37 @@ int hcs_format_sd_continue(
  * Returns bytes written (excluding NUL), or -1 on error (e.g. buffer
  * too small).
  */
+/*
+ * Format the certificate-carrying SD element:
+ *   [mmhashchainsigs-cert@32473 cert="<base64 DER>"]
+ * Emitted by the signer on INIT (and CONTINUE) messages when embedcert
+ * is enabled, so verifiers in CA-bundle mode can chain-validate the
+ * signer's certificate without out-of-band distribution.
+ * Returns bytes written (excluding NUL), or -1 on error.
+ */
+int hcs_format_sd_cert(
+    const unsigned char *der, size_t der_len,
+    char *buf, size_t buf_len);
+
+/*
+ * Locate and strip the [mmhashchainsigs-cert@32473 cert="..."] element
+ * from a string in-place, decoding its DER payload to der_out.
+ * On entry, *der_len is the capacity of der_out.
+ * On success, *der_len is set to the decoded DER length.
+ *
+ * Returns:
+ *    1 if a cert SD was found and stripped (der_out populated)
+ *    0 if no cert SD was present (msg_buf unchanged, *der_len = 0)
+ *   -1 on parse/decode error or insufficient buffer
+ *
+ * It is safe to pass the same buffer as src and msg_buf (in-place strip).
+ */
+int hcs_extract_and_strip_cert_sd(
+    const char *src, size_t src_len,
+    char *msg_buf, size_t msg_buf_cap,
+    int *msg_len_out,
+    unsigned char *der_out, size_t *der_len);
+
 int hcs_format_sd_hdr(
     unsigned int pri,
     const char *ts,

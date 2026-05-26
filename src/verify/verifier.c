@@ -12,6 +12,74 @@
 static void add_error(
     verifier_ctx_t *ctx,
     uint64_t line_num,
+    const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+
+/*
+ * In CA-bundle mode, validate `cert_der` against the trust store and
+ * install its public key on the verifier. Returns 0 on success, -1 on
+ * any failure (chain invalid, unsupported pubkey, etc.). On failure,
+ * records a descriptive error.
+ */
+static int install_pubkey_from_cert(
+    verifier_ctx_t *ctx,
+    const unsigned char *cert_der, size_t cert_der_len,
+    uint64_t line_num)
+{
+    X509 *cert = NULL;
+    if (hcs_x509_from_der(cert_der, cert_der_len, &cert) != 0) {
+        add_error(ctx, line_num,
+                  "failed to parse embedded certificate");
+        return -1;
+    }
+
+    X509_STORE_CTX *sctx = X509_STORE_CTX_new();
+    if (!sctx) {
+        X509_free(cert);
+        return -1;
+    }
+    int rc = -1;
+    if (X509_STORE_CTX_init(sctx, ctx->trust_store, cert, NULL) != 1) {
+        add_error(ctx, line_num,
+                  "X509_STORE_CTX_init failed");
+        goto done;
+    }
+    if (X509_verify_cert(sctx) != 1) {
+        int err = X509_STORE_CTX_get_error(sctx);
+        add_error(ctx, line_num,
+                  "certificate chain validation failed: %s",
+                  X509_verify_cert_error_string(err));
+        goto done;
+    }
+
+    EVP_PKEY *pub = NULL;
+    if (hcs_x509_get_pubkey(cert, &pub) != 0) {
+        add_error(ctx, line_num,
+                  "unsupported public key algorithm in certificate");
+        goto done;
+    }
+    if (ctx->pubkey) {
+        EVP_PKEY_free(ctx->pubkey);
+    }
+    ctx->pubkey = pub;
+    if (hcs_pubkey_fingerprint(ctx->pubkey, ctx->pubkey_fp) != 0) {
+        EVP_PKEY_free(ctx->pubkey);
+        ctx->pubkey = NULL;
+        add_error(ctx, line_num,
+                  "failed to compute pubkey fingerprint from cert");
+        goto done;
+    }
+    ctx->have_pubkey = true;
+    rc = 0;
+
+done:
+    X509_STORE_CTX_free(sctx);
+    X509_free(cert);
+    return rc;
+}
+
+static void add_error(
+    verifier_ctx_t *ctx,
+    uint64_t line_num,
     const char *fmt, ...)
 {
     if (ctx->error_count >= VERIFIER_MAX_ERRORS) {
@@ -29,18 +97,67 @@ static void add_error(
     ctx->error_count++;
 }
 
-int verifier_init(
-    verifier_ctx_t *ctx,
-    const char *pubkey_path,
-    bool strict)
+static int load_pubkey_from_cert_file(
+    const char *cert_path, EVP_PKEY **out)
+{
+    X509 *cert = NULL;
+    if (hcs_load_x509_cert(cert_path, &cert) != 0) {
+        return -1;
+    }
+    int rc = hcs_x509_get_pubkey(cert, out);
+    X509_free(cert);
+    return rc;
+}
+
+int verifier_init(verifier_ctx_t *ctx, const verifier_opts_t *opts)
 {
     memset(ctx, 0, sizeof(*ctx));
     ctx->state = VSTATE_EXPECT_INIT;
-    ctx->strict = strict;
+    ctx->strict = opts->strict;
     ctx->next_seq = 1;
 
-    if (hcs_load_public_key(pubkey_path, &ctx->pubkey) != 0) {
+    int n_set = (opts->pubkey_path != NULL)
+              + (opts->cert_path != NULL)
+              + (opts->ca_bundle_path != NULL);
+    if (n_set != 1) {
         return -1;
+    }
+
+    if (opts->pubkey_path) {
+        if (hcs_load_public_key(
+                opts->pubkey_path, &ctx->pubkey) != 0) {
+            return -1;
+        }
+    } else if (opts->cert_path) {
+        if (load_pubkey_from_cert_file(
+                opts->cert_path, &ctx->pubkey) != 0) {
+            return -1;
+        }
+    } else {
+        /* ca_bundle_path: defer pubkey extraction until we see an
+         * embedded cert on the wire (Phase 3). */
+        ctx->trust_store = X509_STORE_new();
+        if (!ctx->trust_store) {
+            return -1;
+        }
+        if (X509_STORE_load_file(
+                ctx->trust_store, opts->ca_bundle_path) != 1) {
+            X509_STORE_free(ctx->trust_store);
+            ctx->trust_store = NULL;
+            return -1;
+        }
+        if (opts->crl_file) {
+            if (X509_STORE_load_file(
+                    ctx->trust_store, opts->crl_file) != 1) {
+                X509_STORE_free(ctx->trust_store);
+                ctx->trust_store = NULL;
+                return -1;
+            }
+            X509_STORE_set_flags(
+                ctx->trust_store,
+                X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL);
+        }
+        return 0;
     }
 
     if (hcs_pubkey_fingerprint(ctx->pubkey, ctx->pubkey_fp) != 0) {
@@ -48,7 +165,7 @@ int verifier_init(
         ctx->pubkey = NULL;
         return -1;
     }
-
+    ctx->have_pubkey = true;
     return 0;
 }
 
@@ -89,6 +206,7 @@ static int handle_sd_init(
     verifier_ctx_t *ctx,
     const hcs_sd_record_t *sd,
     const char *msg, size_t msg_len,
+    const unsigned char *cert_der, size_t cert_der_len,
     uint64_t line_num)
 {
     if (!sd->has_pubkey_fp) {
@@ -96,6 +214,31 @@ static int handle_sd_init(
         ctx->state = VSTATE_ERROR;
         return -1;
     }
+
+    /* CA-bundle mode: the INIT line must carry an embedded cert,
+     * chain-validate it, then install its pubkey. */
+    if (ctx->trust_store && !ctx->have_pubkey) {
+        if (cert_der_len == 0) {
+            add_error(ctx, line_num,
+                "CA-bundle mode requires an embedded certificate"
+                " on INIT (configure embedcert=on at the signer)");
+            ctx->state = VSTATE_ERROR;
+            return -1;
+        }
+        if (install_pubkey_from_cert(
+                ctx, cert_der, cert_der_len, line_num) != 0) {
+            ctx->state = VSTATE_ERROR;
+            return -1;
+        }
+    }
+
+    if (!ctx->have_pubkey) {
+        add_error(ctx, line_num,
+                  "no public key available to verify INIT");
+        ctx->state = VSTATE_ERROR;
+        return -1;
+    }
+
     if (memcmp(sd->pubkey_fp, ctx->pubkey_fp,
                HCS_HASH_LEN) != 0) {
         add_error(ctx, line_num, "INIT fingerprint mismatch");
@@ -174,7 +317,7 @@ static int handle_sd_sig(
                   (unsigned long)exp_to);
     }
 
-    int vr = hcs_ed25519_verify(
+    int vr = hcs_verify(
         ctx->pubkey, ctx->chain_hash, HCS_HASH_LEN,
         sd->signature, sd->sig_len);
     if (vr == 1) {
@@ -240,6 +383,25 @@ int verifier_process_line(
         return 0;
     }
 
+    /* Also strip a cert SD if present. The cert SD is signer metadata
+     * (parallel to the main chain SD) and is not part of the hashed
+     * payload. Extracted DER is used by INIT handling in CA-bundle mode. */
+    unsigned char cert_der[HCS_CERT_DER_MAX];
+    size_t cert_der_len = sizeof(cert_der);
+    int new_msg_len = 0;
+    int cert_rc = hcs_extract_and_strip_cert_sd(
+        msg, (size_t)msg_len, msg, sizeof(msg),
+        &new_msg_len, cert_der, &cert_der_len);
+    if (cert_rc < 0) {
+        add_error(ctx, line_num, "malformed embedded cert SD element");
+        cert_der_len = 0;
+        new_msg_len = msg_len;
+    }
+    if (cert_rc == 0) {
+        cert_der_len = 0;
+    }
+    msg_len = new_msg_len;
+
     if (ctx->state == VSTATE_EXPECT_INIT &&
         sd.type != HCS_SD_INIT) {
         add_error(ctx, line_num, "expected INIT SD record");
@@ -250,7 +412,7 @@ int verifier_process_line(
     switch (sd.type) {
     case HCS_SD_INIT:
         return handle_sd_init(ctx, &sd, msg, (size_t)msg_len,
-                              line_num);
+                              cert_der, cert_der_len, line_num);
     case HCS_SD_SIG:
         return handle_sd_sig(ctx, &sd, msg, (size_t)msg_len,
                              line_num);
@@ -293,5 +455,9 @@ void verifier_free(verifier_ctx_t *ctx)
     if (ctx->pubkey) {
         EVP_PKEY_free(ctx->pubkey);
         ctx->pubkey = NULL;
+    }
+    if (ctx->trust_store) {
+        X509_STORE_free(ctx->trust_store);
+        ctx->trust_store = NULL;
     }
 }

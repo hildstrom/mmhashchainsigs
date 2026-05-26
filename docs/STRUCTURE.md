@@ -12,25 +12,27 @@
 │   ├── STRUCTURE.md                      This file
 │   ├── DEVENV.md                         Development environment setup
 │   ├── BENCHMARK.md                      Benchmark methodology and results
+│   ├── X509.md                           X.509 cert support: trust modes, wire format, rotation
 │   └── diagrams/                         PlantUML diagrams (see below)
 ├── conf/
 │   └── mmhashchainsigs.conf.example      Example rsyslog configuration
 ├── src/
 │   ├── common/                           Shared library (used by module and verifier)
-│   │   ├── hcs_crypto.{c,h}              Crypto API: SHA-256, Ed25519, key loading
-│   │   └── hcs_format.{c,h}              SD element format and helpers
+│   │   ├── hcs_crypto.{c,h}              Crypto API: SHA-256, Ed25519/ECDSA, key & cert loading
+│   │   └── hcs_format.{c,h}              SD element format and helpers (chain, hdr, cert)
 │   ├── mmhashchainsigs/                  Rsyslog message modification module
 │   │   ├── mmhashchainsigs.{c,h}         Core hash/sign/SD logic + rsyslog boilerplate
 │   │   ├── hashchain.{c,h}               Hash chain state management API
-│   │   └── signer.{c,h}                  Ed25519 signer lifecycle
+│   │   └── signer.{c,h}                  Signer lifecycle (raw PEM or X.509 cert)
 │   └── verify/                           Verification CLI tool
 │       ├── verifier.{c,h}                Verification engine and state machine
 │       └── mmhashchainsigs_verify.c      CLI entry point
 ├── tests/
-│   ├── test_signer.c                     Crypto primitives
+│   ├── test_signer.c                     Crypto primitives (Ed25519 + ECDSA P-256)
 │   ├── test_format.c                     SD record format + strip helpers
 │   ├── test_hashchain.c                  Hash chain semantics
 │   ├── test_mmhashchainsigs.c            mmhashchainsigs + verifier integration
+│   ├── test_x509.c                       X.509 cert loading, signer_init_x509, CA-bundle e2e
 │   └── integration/                      Scripts driving a real rsyslog
 │       ├── send_syslog.c                 Bulk unix-domain syslog sender (C helper)
 │       ├── run.sh                        Functional tests
@@ -60,9 +62,11 @@ rsyslog dependency -- only OpenSSL.
 Core cryptographic operations using OpenSSL 3.0+ EVP API:
 - `hcs_sha256()` -- Single-shot SHA-256 digest
 - `hcs_sha256_chain()` -- Chain hash: `SHA-256(prev || seq_be64 || msg)`
-- `hcs_load_private_key()` / `hcs_load_public_key()` -- PEM key loading with Ed25519 type validation
-- `hcs_ed25519_sign()` / `hcs_ed25519_verify()` -- Single-shot Ed25519 sign/verify
-- `hcs_pubkey_fingerprint()` -- SHA-256 of raw public key bytes
+- `hcs_load_private_key()` / `hcs_load_public_key()` -- PEM key loading (Ed25519 or ECDSA P-256, all other algorithms rejected)
+- `hcs_load_x509_cert()` / `hcs_x509_get_pubkey()` / `hcs_x509_check_keypair()` -- X.509 PEM loading and key/cert match checks
+- `hcs_x509_to_der()` / `hcs_x509_from_der()` -- Cert (de)serialization for embedded-cert SD
+- `hcs_sign()` / `hcs_verify()` -- Algorithm-agnostic sign/verify (PureEdDSA for Ed25519, ECDSA over SHA-256 for P-256)
+- `hcs_pubkey_fingerprint()` -- SHA-256 of raw public key bytes (32B for Ed25519, 65B uncompressed point for P-256)
 
 **hcs_format.{c,h}**
 
@@ -70,6 +74,8 @@ RFC 5424 structured data record format -- the contract between writer and verifi
 - `hcs_chain_init_hash()` -- Well-known initialization vector: `SHA-256("MMHASHCHAINSIGS_CHAIN_INIT_V1")`
 - `hcs_format_sd_init()` / `hcs_format_sd_msg()` / `hcs_format_sd_sig()` / `hcs_format_sd_continue()` -- Format chain-metadata SD elements
 - `hcs_format_sd_hdr()` -- Format the `[mmhashchainsigs-hdr@32473 ...]` element carrying the six captured syslog header fields (`pri`, `ts`, `host`, `app`, `procid`, `msgid`) with RFC 5424 PARAM-VALUE escaping
+- `hcs_format_sd_cert()` -- Format the `[mmhashchainsigs-cert@32473 cert="<b64 DER>"]` element. Emitted on chain-opening lines (INIT, CONTINUE) when the signer has `embedcert=on`. Not part of the hashed payload — verifiers strip it before reconstructing the chain.
+- `hcs_extract_and_strip_cert_sd()` -- Find, parse, and remove the cert SD in a single pass; used by the verifier on every line
 - `hcs_parse_sd()` -- Parse a single `[mmhashchainsigs@32473 ...]` chain-metadata element into fields
 - `hcs_strip_sd_from_line()` -- Find and strip the (leading) chain-metadata SD element from a log line
 - `hcs_strip_all_sd()` -- Remove every element with a given SD-ID from an SD-section string (used by mmhashchainsigs to discard client-supplied `mmhashchainsigs@32473` or `mmhashchainsigs-hdr@32473` collision elements before signing)
@@ -87,10 +93,12 @@ Hash chain state management:
 
 **signer.{c,h}**
 
-Ed25519 signer lifecycle:
+Signer lifecycle (Ed25519 or ECDSA P-256):
 - `signer_init()` -- Load private key from PEM, compute public key fingerprint, reject world-readable keys
-- `signer_sign()` -- Sign data with Ed25519
-- `signer_free()` -- Free key and cleanse memory with `OPENSSL_cleanse()`
+- `signer_init_x509()` -- Same, plus load an X.509 cert and verify it matches the private key
+- `signer_sign()` -- Sign data with the loaded algorithm
+- `signer_get_cert_der()` -- Lazily cache and return DER bytes of the loaded cert (for embedcert)
+- `signer_free()` -- Free key + cert and cleanse memory with `OPENSSL_cleanse()`
 
 **mmhashchainsigs.{c,h}**
 
@@ -108,7 +116,7 @@ Message modification module for RELP transmission signing:
 
 2. **Rsyslog boilerplate** (compiled only without `MMHASHCHAINSIGS_STANDALONE`) -- Module API:
    - Declared via `MODULE_TYPE_OUTPUT` (rsyslog's output module interface)
-   - Configuration parameter parsing (`privatekey`, `signinterval`, `template`, `statefiledir`)
+   - Configuration parameter parsing (`privatekey`, `certificate`, `embedcert`, `signinterval`, `template`, `statefiledir`)
    - `createWrkrInstance`: rejects a second worker (hash chain requires sequential processing); loads saved state from `statefiledir` if present
    - `doAction` handler: capture six header fields from `pMsg`, format the `[mmhashchainsigs-hdr@32473 ...]` element, strip client `mmhashchainsigs@32473` and `mmhashchainsigs-hdr@32473` SDs if any, hash `hdr_SD || cleaned_client_SD || MSG`, prepend the chain-metadata SD element
    - `freeWrkrInstance`: saves chain state to `statefiledir` if unsigned messages remain
@@ -119,27 +127,28 @@ Message modification module for RELP transmission signing:
 
 Verification state machine for SD-formatted logs:
 - States: `EXPECT_INIT` -> `PROCESSING` -> `DONE` (or `ERROR`)
-- `verifier_init()` -- Load public key, compute fingerprint
-- `verifier_process_line()` -- Strip leading `[mmhashchainsigs@32473 ...]` element, hash the remainder, verify chain
+- `verifier_init()` -- Configure trust anchor via `verifier_opts_t`: raw pubkey, pinned leaf cert, or CA bundle (+ optional CRL)
+- `verifier_process_line()` -- Strip leading `[mmhashchainsigs@32473 ...]` element AND any `[mmhashchainsigs-cert@32473 ...]` element, hash the remainder, verify chain. On INIT in CA-bundle mode, chain-validates the embedded cert and installs its pubkey.
 - `verifier_finalize()` -- Check for unsigned tail in strict mode
 - Tracks up to 64 errors with line numbers and descriptive messages
 
 **mmhashchainsigs_verify.c**
 
 CLI entry point:
-- `getopt_long` argument parsing
+- `getopt_long` argument parsing (`-k`/`-c`/`-C`/`--crl-file`)
 - Line-by-line file reading with `getline()`
-- Exit code mapping: 0=pass, 1=integrity failure, 2=usage, 3=key mismatch
+- Exit code mapping: 0=pass, 1=integrity failure, 2=usage, 3=key mismatch, 4=cert chain validation failure
 - Verbose and quiet output modes
 
 ## Test Suites
 
 | File | Tests | What It Covers |
 |------|-------|----------------|
-| `test_signer.c` | 4 | SHA-256 known vector, chain hash, Ed25519 sign/verify roundtrip, fingerprint |
+| `test_signer.c` | 7 | SHA-256 known vector, chain hash, sign/verify roundtrip for Ed25519 and ECDSA P-256, fingerprint match across both, unsupported-key rejection (RSA) |
 | `test_format.c` | 20 | Hex, base64, SD INIT/MSG/SIG/CONTINUE roundtrip, SD strip, bad input rejection, `hcs_strip_all_sd` (empty/none/single/multiple/quoted-bracket/out-too-small/hdr-id/in-place), `hcs_format_sd_hdr` (basic/empty-fields/escaping/buf-too-small) |
 | `test_hashchain.c` | 6 | Chain init IV, update, determinism, ordering, count reset, full reset |
 | `test_mmhashchainsigs.c` | 17 | SD chain verify, tamper detect, multi-segment, single message, `mmhashchainsigs_process_msg`, sign-interval=1, RFC 5424 with client SD, RFC 5424 collision (poisoned `mmhashchainsigs@32473`), hdr chain verify, hdr tamper detect, hdr collision (poisoned `mmhashchainsigs-hdr@32473`), `final_sign` (covers tail, no unsigned, uninitialized), state save/load roundtrip, state inject+verify (full shutdown/restart flow), state no-unsigned |
+| `test_x509.c` | 8 | Load cert + extract pubkey, RSA cert rejection, `signer_init_x509` happy path / key-cert mismatch / RSA reject, e2e sign-with-cert + verify-with-pinned-cert (ECDSA P-256), e2e CA-bundle (positive + wrong-CA negative), CA-bundle requires `embedcert=on` |
 
 All tests generate temporary Ed25519 key pairs at runtime. No test fixtures are
 checked in.
@@ -153,7 +162,7 @@ required. They are not part of `make test` (which runs unit tests only).
 | Script / source | What It Covers |
 |-----------------|----------------|
 | `send_syslog.c` | Opens the unix datagram socket once and sends N RFC 3164 messages -- avoids the cost of forking `logger` per message |
-| `run.sh` | 8 tests: `imuxsock`-based write+verify and tamper detection; `imptcp` + `rsyslog.rfc5424` parser tests for RFC 5424 with client SD, SD-ID collision, distinct-per-message header capture, and header-value tamper detection; `statefiledir` shutdown+restart (state file written, consumed on restart, strict verification passes); no-statefiledir strict-mode unsigned-tail detection |
+| `run.sh` | 12 tests: `imuxsock`-based write+verify and tamper detection; `imptcp` + `rsyslog.rfc5424` parser tests for RFC 5424 with client SD, SD-ID collision, distinct-per-message header capture, and header-value tamper detection; `statefiledir` shutdown+restart (state file written, consumed on restart, strict verification passes); no-statefiledir strict-mode unsigned-tail detection; X.509 pinned-cert sign+verify (both `--cert` and `--publickey` accept the cert's key); ECDSA P-256 end-to-end; CA-bundle with `embedcert=on` positive + wrong-CA chain-validation failure (exit code 4); CA-bundle missing-embedcert clear-error path |
 | `bench.sh` | Throughput comparison: baseline omfile vs `mmhashchainsigs` + omfile. Also measures `mmhashchainsigs-verify` throughput |
 
 Both scripts run the sender, sleep briefly so rsyslog can drain the socket

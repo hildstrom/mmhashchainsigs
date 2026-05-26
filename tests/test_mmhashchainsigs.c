@@ -103,7 +103,7 @@ static int builder_add_msg(
     case SD_LINE_SIG: {
         unsigned char sig_buf[HCS_SIG_MAX_LEN];
         size_t slen = sizeof(sig_buf);
-        assert(hcs_ed25519_sign(
+        assert(hcs_sign(
             b->signer.privkey, b->chain.current,
             HCS_HASH_LEN, sig_buf, &slen) == 0);
         sd_len = hcs_format_sd_sig(
@@ -138,7 +138,7 @@ static void test_sd_chain_verify(void)
     builder_init(&b, 4);
 
     verifier_ctx_t vctx;
-    assert(verifier_init(&vctx, pubkey_path, 1) == 0);
+    assert(verifier_init(&vctx, &(verifier_opts_t){.pubkey_path=pubkey_path, .strict=1}) == 0);
 
     for (int i = 0; i < 12; i++) {
         char msg[128];
@@ -210,7 +210,7 @@ static void test_sd_tamper_detect(void)
     closing[1] = 'X';
 
     verifier_ctx_t vctx;
-    assert(verifier_init(&vctx, pubkey_path, 0) == 0);
+    assert(verifier_init(&vctx, &(verifier_opts_t){.pubkey_path=pubkey_path, .strict=0}) == 0);
 
     for (int i = 0; i < 4; i++) {
         verifier_process_line(&vctx, lines[i], line_lens[i],
@@ -229,7 +229,7 @@ static void test_sd_multi_segment(void)
     builder_init(&b, 100);
 
     verifier_ctx_t vctx;
-    assert(verifier_init(&vctx, pubkey_path, 1) == 0);
+    assert(verifier_init(&vctx, &(verifier_opts_t){.pubkey_path=pubkey_path, .strict=1}) == 0);
 
     int line_num = 0;
 
@@ -297,7 +297,7 @@ static void test_sd_single_message(void)
     builder_init(&b, 1);
 
     verifier_ctx_t vctx;
-    assert(verifier_init(&vctx, pubkey_path, 1) == 0);
+    assert(verifier_init(&vctx, &(verifier_opts_t){.pubkey_path=pubkey_path, .strict=1}) == 0);
 
     /* Single message that is both INIT and SIG */
     char msg[] = "only message";
@@ -308,7 +308,7 @@ static void test_sd_single_message(void)
 
     unsigned char sig_buf[HCS_SIG_MAX_LEN];
     size_t slen = sizeof(sig_buf);
-    assert(hcs_ed25519_sign(
+    assert(hcs_sign(
         b.signer.privkey, b.chain.current,
         HCS_HASH_LEN, sig_buf, &slen) == 0);
 
@@ -333,7 +333,7 @@ static void test_sd_single_message(void)
     hashchain_update(&b.chain, msg2, strlen(msg2));
     seq = b.chain.seq - 1;
     slen = sizeof(sig_buf);
-    assert(hcs_ed25519_sign(
+    assert(hcs_sign(
         b.signer.privkey, b.chain.current,
         HCS_HASH_LEN, sig_buf, &slen) == 0);
 
@@ -368,7 +368,7 @@ static void test_mmhashchainsigs_process(void)
     };
 
     verifier_ctx_t vctx;
-    assert(verifier_init(&vctx, pubkey_path, 1) == 0);
+    assert(verifier_init(&vctx, &(verifier_opts_t){.pubkey_path=pubkey_path, .strict=1}) == 0);
 
     for (int i = 0; i < 12; i++) {
         char msg[128];
@@ -416,7 +416,7 @@ static void test_mmhashchainsigs_sign_interval(void)
     };
 
     verifier_ctx_t vctx;
-    assert(verifier_init(&vctx, pubkey_path, 1) == 0);
+    assert(verifier_init(&vctx, &(verifier_opts_t){.pubkey_path=pubkey_path, .strict=1}) == 0);
 
     for (int i = 0; i < 5; i++) {
         char msg[128];
@@ -535,7 +535,7 @@ static void test_rfc5424_with_client_sd(void)
     mmhashchainsigs_worker_t wrkr = { .inst = &inst, .initialized = 0 };
 
     verifier_ctx_t vctx;
-    assert(verifier_init(&vctx, pubkey_path, 1) == 0);
+    assert(verifier_init(&vctx, &(verifier_opts_t){.pubkey_path=pubkey_path, .strict=1}) == 0);
 
     const char *client_sd =
         "[client@9999 trace=\"abc\" span=\"42\"]";
@@ -587,7 +587,7 @@ static void test_rfc5424_with_collision(void)
     mmhashchainsigs_worker_t wrkr = { .inst = &inst, .initialized = 0 };
 
     verifier_ctx_t vctx;
-    assert(verifier_init(&vctx, pubkey_path, 1) == 0);
+    assert(verifier_init(&vctx, &(verifier_opts_t){.pubkey_path=pubkey_path, .strict=1}) == 0);
 
     const char *poisoned_sd =
         "[mmhashchainsigs@32473 t=\"I\" q=\"99\" h=\"deadbeef\" f=\"cafe\"]"
@@ -638,7 +638,7 @@ static void test_hdr_chain_verify(void)
     mmhashchainsigs_worker_t wrkr = { .inst = &inst, .initialized = 0 };
 
     verifier_ctx_t vctx;
-    assert(verifier_init(&vctx, pubkey_path, 1) == 0);
+    assert(verifier_init(&vctx, &(verifier_opts_t){.pubkey_path=pubkey_path, .strict=1}) == 0);
 
     for (int i = 0; i < 9; i++) {
         char ts[32], host[32], app[32], procid[16], msgid[16];
@@ -721,7 +721,7 @@ static void test_hdr_tamper_detect(void)
     memcpy(h + 6, "ATTACKER!!", 10);
 
     verifier_ctx_t vctx;
-    assert(verifier_init(&vctx, pubkey_path, 0) == 0);
+    assert(verifier_init(&vctx, &(verifier_opts_t){.pubkey_path=pubkey_path, .strict=0}) == 0);
     for (int i = 0; i < 3; i++) {
         verifier_process_line(&vctx, lines[i], line_lens[i],
                               (uint64_t)(i + 1));
@@ -746,7 +746,7 @@ static void test_hdr_collision(void)
     mmhashchainsigs_worker_t wrkr = { .inst = &inst, .initialized = 0 };
 
     verifier_ctx_t vctx;
-    assert(verifier_init(&vctx, pubkey_path, 1) == 0);
+    assert(verifier_init(&vctx, &(verifier_opts_t){.pubkey_path=pubkey_path, .strict=1}) == 0);
 
     sim_hdr_t real_hdr = {
         .pri = 13, .ts = "2026-05-25T12:00:00Z",
@@ -814,7 +814,7 @@ static void test_final_sign_covers_tail(void)
     };
 
     verifier_ctx_t vctx;
-    assert(verifier_init(&vctx, pubkey_path, 1) == 0);
+    assert(verifier_init(&vctx, &(verifier_opts_t){.pubkey_path=pubkey_path, .strict=1}) == 0);
 
     char lines[7][8192];
     size_t line_lens[7];
@@ -1036,7 +1036,7 @@ static void test_state_inject_and_verify(void)
 
     /* Verify the full 11-line log in strict mode */
     verifier_ctx_t vctx;
-    assert(verifier_init(&vctx, pubkey_path, 1) == 0);
+    assert(verifier_init(&vctx, &(verifier_opts_t){.pubkey_path=pubkey_path, .strict=1}) == 0);
 
     for (int i = 0; i < lc; i++) {
         int r = verifier_process_line(

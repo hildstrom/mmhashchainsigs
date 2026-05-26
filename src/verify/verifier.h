@@ -7,6 +7,8 @@
 #include "hcs_crypto.h"
 #include "hcs_format.h"
 
+#include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -25,10 +27,31 @@ typedef struct {
 
 #define VERIFIER_MAX_ERRORS 64
 
+/*
+ * Trust model: exactly one of pubkey_path, cert_path, or ca_bundle_path
+ * must be set.
+ *
+ *   pubkey_path     -- raw PEM SubjectPublicKeyInfo
+ *   cert_path       -- pinned X.509 leaf certificate PEM (validity period
+ *                      not enforced; the cert just supplies the pubkey)
+ *   ca_bundle_path  -- PEM bundle of trust anchors; the verifier accepts
+ *                      any in-band certificate that chains to the bundle
+ *   crl_file        -- optional CRL file used only with ca_bundle_path
+ */
+typedef struct {
+    const char *pubkey_path;
+    const char *cert_path;
+    const char *ca_bundle_path;
+    const char *crl_file;
+    bool strict;
+} verifier_opts_t;
+
 typedef struct {
     verifier_state_t state;
     EVP_PKEY *pubkey;
     unsigned char pubkey_fp[HCS_HASH_LEN];
+    bool have_pubkey;        /* false in ca_bundle mode until first cert seen */
+    X509_STORE *trust_store; /* non-NULL only in ca_bundle mode */
     unsigned char chain_hash[HCS_HASH_LEN];
     uint64_t next_seq;
     uint64_t msg_count;
@@ -41,13 +64,11 @@ typedef struct {
 } verifier_ctx_t;
 
 /*
- * Initialize verifier with a public key PEM file.
+ * Initialize the verifier. Exactly one of opts->pubkey_path,
+ * opts->cert_path, or opts->ca_bundle_path must be set.
  * Returns 0 on success, -1 on error.
  */
-int verifier_init(
-    verifier_ctx_t *ctx,
-    const char *pubkey_path,
-    bool strict);
+int verifier_init(verifier_ctx_t *ctx, const verifier_opts_t *opts);
 
 /*
  * Process one line from the log file.
@@ -67,9 +88,7 @@ int verifier_process_line(
  */
 int verifier_finalize(verifier_ctx_t *ctx);
 
-/*
- * Returns true if verification passed (no errors).
- */
+/* Returns true if verification passed (no errors). */
 bool verifier_passed(const verifier_ctx_t *ctx);
 
 /* Free verifier resources. */

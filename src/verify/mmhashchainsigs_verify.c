@@ -1,7 +1,7 @@
 /*
  * mmhashchainsigs_verify.c - CLI tool for verifying mmhashchainsigs-protected log files
  *
- * Usage: mmhashchainsigs-verify -k <pubkey.pem> [OPTIONS] <logfile>
+ * Usage: mmhashchainsigs-verify (-k <pubkey.pem> | -c <cert.pem> | -C <ca.pem>) [OPTIONS] <logfile>
  */
 #include "verifier.h"
 
@@ -14,11 +14,21 @@
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s -k <pubkey.pem> [OPTIONS] <logfile>\n"
+        "Usage: %s (-k <pubkey.pem> | -c <cert.pem> |"
+        " -C <ca.pem>) [OPTIONS] <logfile>\n"
+        "\n"
+        "Trust anchor (exactly one is required):\n"
+        "  -k, --publickey <path>  "
+            "Raw PEM public key (Ed25519 or ECDSA P-256)\n"
+        "  -c, --cert <path>       "
+            "Pinned X.509 leaf certificate PEM\n"
+        "  -C, --ca-bundle <path>  "
+            "PEM bundle of CA certificates; the signer's cert\n"
+        "                          must be embedded in the log and chain to a CA\n"
+        "      --crl-file <path>   "
+            "Optional CRL file (only with --ca-bundle)\n"
         "\n"
         "Options:\n"
-        "  -k, --publickey <path>  "
-            "Path to Ed25519 public key PEM (required)\n"
         "  -v, --verbose           "
             "Print per-block verification details\n"
         "  -q, --quiet             "
@@ -30,8 +40,13 @@ static void usage(const char *prog)
         prog);
 }
 
+enum { OPT_CRL_FILE = 1000 };
+
 static const struct option long_opts[] = {
     {"publickey", required_argument, NULL, 'k'},
+    {"cert",      required_argument, NULL, 'c'},
+    {"ca-bundle", required_argument, NULL, 'C'},
+    {"crl-file",  required_argument, NULL, OPT_CRL_FILE},
     {"verbose",   no_argument,       NULL, 'v'},
     {"quiet",     no_argument,       NULL, 'q'},
     {"strict",    no_argument,       NULL, 's'},
@@ -41,28 +56,40 @@ static const struct option long_opts[] = {
 
 int main(int argc, char **argv)
 {
-    const char *pubkey_path = NULL;
+    verifier_opts_t opts = {0};
     const char *logfile_path = NULL;
     int verbose = 0;
     int quiet = 0;
-    int strict = 0;
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "k:vqsh",
+    while ((opt = getopt_long(argc, argv, "k:c:C:vqsh",
                               long_opts, NULL)) != -1) {
         switch (opt) {
-        case 'k': pubkey_path = optarg; break;
+        case 'k': opts.pubkey_path = optarg; break;
+        case 'c': opts.cert_path = optarg; break;
+        case 'C': opts.ca_bundle_path = optarg; break;
+        case OPT_CRL_FILE: opts.crl_file = optarg; break;
         case 'v': verbose = 1; break;
         case 'q': quiet = 1; break;
-        case 's': strict = 1; break;
+        case 's': opts.strict = true; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
     }
 
-    if (!pubkey_path) {
-        fprintf(stderr, "Error: --publickey is required\n");
+    int n_trust = (opts.pubkey_path != NULL)
+                + (opts.cert_path != NULL)
+                + (opts.ca_bundle_path != NULL);
+    if (n_trust != 1) {
+        fprintf(stderr,
+                "Error: exactly one of --publickey, --cert,"
+                " or --ca-bundle is required\n");
         usage(argv[0]);
+        return 2;
+    }
+    if (opts.crl_file && !opts.ca_bundle_path) {
+        fprintf(stderr,
+                "Error: --crl-file requires --ca-bundle\n");
         return 2;
     }
 
@@ -74,10 +101,10 @@ int main(int argc, char **argv)
     logfile_path = argv[optind];
 
     verifier_ctx_t ctx;
-    if (verifier_init(&ctx, pubkey_path, strict) != 0) {
+    if (verifier_init(&ctx, &opts) != 0) {
         fprintf(stderr,
-                "Error: failed to load public key: %s\n",
-                pubkey_path);
+                "Error: failed to initialize verifier"
+                " (check key/cert paths and formats)\n");
         return 2;
     }
 
@@ -97,7 +124,6 @@ int main(int argc, char **argv)
     while ((line_len = getline(&line, &line_cap, fp)) != -1) {
         line_num++;
 
-        /* Strip trailing newline */
         while (line_len > 0
                && (line[line_len - 1] == '\n'
                    || line[line_len - 1] == '\r')) {
@@ -139,13 +165,19 @@ int main(int argc, char **argv)
                 }
             }
         }
-        /* Distinguish key mismatch from integrity failure */
+        /* Map error categories to distinct exit codes:
+         *   1 = integrity failure
+         *   3 = key/fingerprint mismatch
+         *   4 = certificate chain validation failure */
         exit_code = 1;
         for (int i = 0; i < ctx.error_count; i++) {
-            if (strstr(ctx.errors[i].message,
-                       "fingerprint mismatch")) {
+            const char *m = ctx.errors[i].message;
+            if (strstr(m, "fingerprint mismatch")) {
                 exit_code = 3;
                 break;
+            }
+            if (strstr(m, "certificate") || strstr(m, "chain validation")) {
+                exit_code = 4;
             }
         }
     }

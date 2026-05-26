@@ -59,6 +59,60 @@ generate_keys() {
         -out "$TMPDIR_BASE/pubkey.pem" 2>/dev/null
 }
 
+# Generate an ECDSA P-256 key pair (used by the x509 ecdsa test).
+generate_ecdsa_keys() {
+    openssl genpkey -algorithm EC \
+        -pkeyopt ec_paramgen_curve:P-256 \
+        -out "$TMPDIR_BASE/privkey-ec.pem" 2>/dev/null
+    chmod 600 "$TMPDIR_BASE/privkey-ec.pem"
+    openssl pkey -in "$TMPDIR_BASE/privkey-ec.pem" -pubout \
+        -out "$TMPDIR_BASE/pubkey-ec.pem" 2>/dev/null
+}
+
+# Generate a self-signed leaf cert from $TMPDIR_BASE/privkey.pem.
+generate_selfsigned_cert() {
+    openssl req -new -x509 -key "$TMPDIR_BASE/privkey.pem" \
+        -days 1 -subj "/CN=mmhcs-integ-leaf" \
+        -out "$TMPDIR_BASE/cert.pem" 2>/dev/null
+}
+
+# Generate a CA + leaf cert chain. Outputs:
+#   $TMPDIR_BASE/ca.pem        (CA cert PEM, also used as --ca-bundle)
+#   $TMPDIR_BASE/leaf.pem      (leaf cert PEM, CA-signed)
+#   privkey.pem already exists; the leaf is bound to it.
+generate_ca_and_leaf() {
+    # CA key + self-signed CA cert with CA:TRUE.
+    openssl genpkey -algorithm Ed25519 \
+        -out "$TMPDIR_BASE/ca-priv.pem" 2>/dev/null
+    chmod 600 "$TMPDIR_BASE/ca-priv.pem"
+
+    cat > "$TMPDIR_BASE/ca.cnf" <<EOF
+[req]
+distinguished_name = req_dn
+prompt             = no
+x509_extensions    = v3_ca
+[req_dn]
+CN = mmhcs-integ-CA
+[v3_ca]
+basicConstraints   = critical,CA:TRUE
+keyUsage           = critical,keyCertSign
+EOF
+
+    openssl req -new -x509 -key "$TMPDIR_BASE/ca-priv.pem" \
+        -days 1 -config "$TMPDIR_BASE/ca.cnf" \
+        -out "$TMPDIR_BASE/ca.pem" 2>/dev/null
+
+    # Leaf CSR signed by the CA. The leaf shares the existing privkey.pem.
+    openssl req -new -key "$TMPDIR_BASE/privkey.pem" \
+        -subj "/CN=mmhcs-integ-leaf" \
+        -out "$TMPDIR_BASE/leaf.csr" 2>/dev/null
+
+    openssl x509 -req -in "$TMPDIR_BASE/leaf.csr" \
+        -CA "$TMPDIR_BASE/ca.pem" -CAkey "$TMPDIR_BASE/ca-priv.pem" \
+        -CAcreateserial -days 1 \
+        -out "$TMPDIR_BASE/leaf.pem" 2>/dev/null
+}
+
 start_rsyslog() {
     local conf="$1"
     rsyslogd -f "$conf" \
@@ -630,12 +684,243 @@ EOF
     fi
 }
 
+# --- Test: X.509 pinned-leaf — sign with certificate=, verify with --cert ---
+test_x509_pinned_cert() {
+    local logfile="$TMPDIR_BASE/x509-pinned.log"
+    local conf="$TMPDIR_BASE/x509-pinned.conf"
+
+    cat > "$conf" <<EOF
+global(workDirectory="$TMPDIR_BASE")
+
+module(load="imuxsock" SysSock.Use="off")
+input(type="imuxsock" Socket="$SOCK")
+module(load="$MMHASHCHAINSIGS_SO")
+
+template(name="sd-preserve" type="string"
+    string="%STRUCTURED-DATA%%msg%\n")
+
+*.* {
+    action(
+        type="mmhashchainsigs"
+        privatekey="$TMPDIR_BASE/privkey.pem"
+        certificate="$TMPDIR_BASE/cert.pem"
+        signinterval="5"
+    )
+    action(
+        type="omfile"
+        file="$logfile"
+        template="sd-preserve"
+    )
+}
+EOF
+
+    start_rsyslog "$conf"
+    send_and_drain 12 "mmhcs-x509pin"
+
+    if [ ! -f "$logfile" ]; then
+        echo "    logfile not created" >&2
+        cat "$TMPDIR_BASE/rsyslog.err" >&2
+        report "x509_pinned_cert" 1
+        return
+    fi
+
+    # Verify with --cert (pinned leaf).
+    local pin pub
+    "$VERIFY" --cert "$TMPDIR_BASE/cert.pem" "$logfile" \
+        >/dev/null 2>&1 && pin=0 || pin=$?
+
+    # Also verify with --publickey using the same key's PEM — the
+    # fingerprint must match because both forms wrap the same key.
+    "$VERIFY" --publickey "$TMPDIR_BASE/pubkey.pem" "$logfile" \
+        >/dev/null 2>&1 && pub=0 || pub=$?
+
+    if [ "$pin" -eq 0 ] && [ "$pub" -eq 0 ]; then
+        report "x509_pinned_cert" 0
+    else
+        echo "    pin=$pin pub=$pub (expected 0,0)" >&2
+        report "x509_pinned_cert" 1
+    fi
+}
+
+# --- Test: ECDSA P-256 key end-to-end ---
+test_x509_ecdsa_p256() {
+    local logfile="$TMPDIR_BASE/x509-ecdsa.log"
+    local conf="$TMPDIR_BASE/x509-ecdsa.conf"
+
+    cat > "$conf" <<EOF
+global(workDirectory="$TMPDIR_BASE")
+
+module(load="imuxsock" SysSock.Use="off")
+input(type="imuxsock" Socket="$SOCK")
+module(load="$MMHASHCHAINSIGS_SO")
+
+template(name="sd-preserve" type="string"
+    string="%STRUCTURED-DATA%%msg%\n")
+
+*.* {
+    action(
+        type="mmhashchainsigs"
+        privatekey="$TMPDIR_BASE/privkey-ec.pem"
+        signinterval="5"
+    )
+    action(
+        type="omfile"
+        file="$logfile"
+        template="sd-preserve"
+    )
+}
+EOF
+
+    start_rsyslog "$conf"
+    send_and_drain 12 "mmhcs-ecdsa"
+
+    if [ ! -f "$logfile" ]; then
+        echo "    logfile not created" >&2
+        cat "$TMPDIR_BASE/rsyslog.err" >&2
+        report "x509_ecdsa_p256" 1
+        return
+    fi
+
+    "$VERIFY" --publickey "$TMPDIR_BASE/pubkey-ec.pem" "$logfile" \
+        >/dev/null 2>&1
+    report "x509_ecdsa_p256" $?
+}
+
+# --- Test: CA-bundle mode with embedcert=on ---
+test_x509_ca_bundle() {
+    local logfile="$TMPDIR_BASE/x509-cabundle.log"
+    local conf="$TMPDIR_BASE/x509-cabundle.conf"
+
+    cat > "$conf" <<EOF
+global(workDirectory="$TMPDIR_BASE")
+
+module(load="imuxsock" SysSock.Use="off")
+input(type="imuxsock" Socket="$SOCK")
+module(load="$MMHASHCHAINSIGS_SO")
+
+template(name="sd-preserve" type="string"
+    string="%STRUCTURED-DATA%%msg%\n")
+
+*.* {
+    action(
+        type="mmhashchainsigs"
+        privatekey="$TMPDIR_BASE/privkey.pem"
+        certificate="$TMPDIR_BASE/leaf.pem"
+        embedcert="on"
+        signinterval="5"
+    )
+    action(
+        type="omfile"
+        file="$logfile"
+        template="sd-preserve"
+    )
+}
+EOF
+
+    start_rsyslog "$conf"
+    send_and_drain 12 "mmhcs-ca"
+
+    if [ ! -f "$logfile" ]; then
+        echo "    logfile not created" >&2
+        cat "$TMPDIR_BASE/rsyslog.err" >&2
+        report "x509_ca_bundle" 1
+        return
+    fi
+
+    # The first line (INIT) must contain the embedded cert SD.
+    if ! head -1 "$logfile" | grep -q 'mmhashchainsigs-cert@32473 cert="'; then
+        echo "    INIT line missing embedded cert SD" >&2
+        head -1 "$logfile" >&2
+        report "x509_ca_bundle" 1
+        return
+    fi
+
+    # Positive case: verify with the real CA bundle.
+    local good bad
+    "$VERIFY" --ca-bundle "$TMPDIR_BASE/ca.pem" "$logfile" \
+        >/dev/null 2>&1 && good=0 || good=$?
+
+    # Negative case: verify with a different CA — must fail with exit 4
+    # (chain validation failure).
+    openssl genpkey -algorithm Ed25519 \
+        -out "$TMPDIR_BASE/badca-priv.pem" 2>/dev/null
+    openssl req -new -x509 -key "$TMPDIR_BASE/badca-priv.pem" \
+        -days 1 -subj "/CN=mmhcs-bad-CA" \
+        -out "$TMPDIR_BASE/badca.pem" 2>/dev/null
+
+    "$VERIFY" --ca-bundle "$TMPDIR_BASE/badca.pem" "$logfile" \
+        >/dev/null 2>&1 && bad=0 || bad=$?
+
+    if [ "$good" -eq 0 ] && [ "$bad" -eq 4 ]; then
+        report "x509_ca_bundle" 0
+    else
+        echo "    good=$good bad=$bad (expected 0, 4)" >&2
+        report "x509_ca_bundle" 1
+    fi
+}
+
+# --- Test: CA-bundle without embedcert must fail clearly ---
+test_x509_ca_bundle_requires_embed() {
+    local logfile="$TMPDIR_BASE/x509-noembed.log"
+    local conf="$TMPDIR_BASE/x509-noembed.conf"
+
+    cat > "$conf" <<EOF
+global(workDirectory="$TMPDIR_BASE")
+
+module(load="imuxsock" SysSock.Use="off")
+input(type="imuxsock" Socket="$SOCK")
+module(load="$MMHASHCHAINSIGS_SO")
+
+template(name="sd-preserve" type="string"
+    string="%STRUCTURED-DATA%%msg%\n")
+
+*.* {
+    action(
+        type="mmhashchainsigs"
+        privatekey="$TMPDIR_BASE/privkey.pem"
+        certificate="$TMPDIR_BASE/leaf.pem"
+        signinterval="5"
+    )
+    action(
+        type="omfile"
+        file="$logfile"
+        template="sd-preserve"
+    )
+}
+EOF
+
+    start_rsyslog "$conf"
+    send_and_drain 6 "mmhcs-noembed"
+
+    if [ ! -f "$logfile" ]; then
+        report "x509_ca_bundle_requires_embed" 1
+        return
+    fi
+
+    # CA-bundle verification must fail because the signer didn't embed
+    # the cert. The error message should mention embedded certificate.
+    local out status
+    out=$("$VERIFY" --ca-bundle "$TMPDIR_BASE/ca.pem" "$logfile" 2>&1) \
+        && status=0 || status=$?
+
+    if [ "$status" -ne 0 ] && echo "$out" \
+            | grep -q "requires an embedded certificate"; then
+        report "x509_ca_bundle_requires_embed" 0
+    else
+        echo "    unexpected status=$status output: $out" >&2
+        report "x509_ca_bundle_requires_embed" 1
+    fi
+}
+
 # --- Main ---
 main() {
     echo "=== mmhashchainsigs integration tests ==="
     preflight
     setup_tmpdir
     generate_keys
+    generate_ecdsa_keys
+    generate_selfsigned_cert
+    generate_ca_and_leaf
 
     test_mmhashchainsigs_basic
     test_mmhashchainsigs_tamper
@@ -645,6 +930,10 @@ main() {
     test_rfc5424_header_tamper
     test_statefiledir_restart
     test_no_statefiledir_strict
+    test_x509_pinned_cert
+    test_x509_ecdsa_p256
+    test_x509_ca_bundle
+    test_x509_ca_bundle_requires_embed
 
     echo ""
     echo "=== Results: $PASS passed, $FAIL failed ==="

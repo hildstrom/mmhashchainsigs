@@ -25,9 +25,11 @@ typedef struct mmhashchainsigs_saved_state {
 
 typedef struct mmhashchainsigs_instance {
     char *privkey_path;
+    char *cert_path;       /* optional X.509 cert PEM; raw-key mode if NULL */
     char *tpl_name;
     char *statefiledir;
     unsigned int sign_interval;
+    int embedcert;         /* emit cert in INIT/CONTINUE SD (Phase 3) */
 } mmhashchainsigs_instance_t;
 
 typedef struct mmhashchainsigs_worker {

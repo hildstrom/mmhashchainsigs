@@ -1,15 +1,19 @@
 # Example rsyslog configuration for mmhashchainsigs
 #
-# Generate keys first:
-#   tools/mmhashchainsigs-keygen.sh /etc/rsyslog.d/
+# Generate keys first (pick one):
+#   tools/mmhashchainsigs-keygen.sh keygen   --outdir /etc/rsyslog.d/
+#   tools/mmhashchainsigs-keygen.sh selfsign --outdir /etc/rsyslog.d/ --cn $(hostname)
+#   tools/mmhashchainsigs-keygen.sh csr      --outdir /etc/rsyslog.d/ --cn $(hostname)
 #
 # Create state directory (for shutdown state persistence):
 #   mkdir -p /var/lib/mmhashchainsigs
 #   chown root:root /var/lib/mmhashchainsigs
 #   chmod 700 /var/lib/mmhashchainsigs
 #
-# Verify logs (received side):
-#   mmhashchainsigs-verify -k /path/to/mmhashchainsigs-public.pem /var/log/secure-audit.log
+# Verify logs (received side) — pick the trust mode that matches the signer:
+#   mmhashchainsigs-verify --publickey /path/to/mmhashchainsigs-public.pem  /var/log/secure-audit.log
+#   mmhashchainsigs-verify --cert      /path/to/mmhashchainsigs-cert.pem    /var/log/secure-audit.log
+#   mmhashchainsigs-verify --ca-bundle /path/to/ca-bundle.pem               /var/log/secure-audit.log
 
 module(load="mmhashchainsigs")
 
@@ -32,6 +36,13 @@ template(name="sd-preserve" type="string"
     action(
         type="mmhashchainsigs"
         privatekey="/etc/rsyslog.d/mmhashchainsigs-private.pem"
+        # Optional: wrap the key in an X.509 certificate. Required for
+        # --cert (pinned leaf) or --ca-bundle verification modes.
+        #certificate="/etc/rsyslog.d/mmhashchainsigs-cert.pem"
+        # Optional: embed the cert in chain INIT lines so CA-bundle
+        # verifiers can chain-validate without out-of-band distribution.
+        # Requires `certificate=`.
+        #embedcert="on"
         signinterval="1024"
         statefiledir="/var/lib/mmhashchainsigs"
         queue.workerThreads="1"
