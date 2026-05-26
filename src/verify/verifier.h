@@ -52,7 +52,12 @@ typedef struct {
     unsigned char pubkey_fp[HCS_HASH_LEN];
     bool have_pubkey;        /* false in ca_bundle mode until first cert seen */
     X509_STORE *trust_store; /* non-NULL only in ca_bundle mode */
-    unsigned char chain_hash[HCS_HASH_LEN];
+    /* Chain hash algorithm is auto-detected from the first INIT line's
+     * h= width. Subsequent lines must match the same algorithm. */
+    hcs_hash_alg_t hash_alg;
+    size_t hash_len;
+    bool have_hash_alg;
+    unsigned char chain_hash[HCS_HASH_MAX_LEN];
     uint64_t next_seq;
     uint64_t msg_count;
     uint64_t sig_count;

@@ -3,11 +3,12 @@
 Cryptographic integrity for syslog records carried over RELP.
 
 `mmhashchainsigs` is an rsyslog message-modification module that attaches
-a SHA-256 hash chain and periodic signatures (Ed25519 or ECDSA P-256) to
-every message as RFC 5424 structured data. Keys may be supplied as raw
-PEM or wrapped in an X.509 certificate. The receiver stores the messages
-as delivered and uses the companion `mmhashchainsigs-verify` tool to
-detect tampering, deletion, insertion, or reordering of records.
+a SHA-256, SHA-384, or SHA-512 hash chain and periodic signatures (Ed25519 or
+ECDSA P-256 / P-384 / P-521) to every message as RFC 5424 structured data. Keys may be
+supplied as raw PEM or wrapped in an X.509 certificate. The receiver
+stores the messages as delivered and uses the companion
+`mmhashchainsigs-verify` tool to detect tampering, deletion, insertion,
+or reordering of records.
 
 See [docs/STRUCTURE.md](docs/STRUCTURE.md) for the source layout,
 [docs/BENCHMARK.md](docs/BENCHMARK.md) for throughput numbers, and
@@ -66,15 +67,16 @@ Three ways to convey signer identity to the verifier:
 | Pinned X.509 cert | `privatekey=key.pem` `certificate=cert.pem` | `--cert cert.pem` | You want an X.509 envelope (audit policy, future PKI rollout) but no chain validation. Verifier pins the leaf. Cert validity dates are not enforced. |
 | CA-validated cert | `privatekey=key.pem` `certificate=cert.pem` `embedcert=on` | `--ca-bundle ca.pem` [`--crl-file crl.pem`] | Standard PKI deployment. Operators rotate certs through their CA; verifiers only need the CA bundle. Cert chain is validated on every chain INIT line. |
 
-Ed25519 and ECDSA P-256 are interchangeable across all three modes — pick
-one per signing host. See [docs/X509.md](docs/X509.md) for the full design.
+Ed25519 and ECDSA (P-256, P-384, P-521) are interchangeable across all
+three modes — pick one per signing host. See [docs/X509.md](docs/X509.md) for the full design.
 
 ## How It Works
 
 1. **Hash chaining** -- Each message is chained:
-   `H(n) = SHA-256(H(n-1) || sequence_number || message)`.
-   Modifying, removing, or reordering any message breaks the chain for all
-   subsequent messages.
+   `H(n) = HASH(H(n-1) || sequence_number || message)`.
+   `HASH` is SHA-256 by default; SHA-384 and SHA-512 are also available
+   via the `hashalgo` config option. Modifying, removing, or reordering any
+   message breaks the chain for all subsequent messages.
 
 2. **Periodic signing** -- Every N messages (default 1024), mmhashchainsigs signs
    the current chain hash with Ed25519 and embeds the signature in the
@@ -92,7 +94,7 @@ one per signing host. See [docs/X509.md](docs/X509.md) for the full design.
 
 ## Dependencies
 
-- OpenSSL >= 3.0 (libcrypto) -- SHA-256 and Ed25519
+- OpenSSL >= 3.0 (libcrypto) -- SHA-256/384/512, Ed25519, ECDSA P-256/P-384/P-521
 - rsyslog development headers -- only needed to build the module
 - GCC, GNU Make, pkg-config
 
@@ -146,7 +148,8 @@ tools/mmhashchainsigs-keygen.sh csr --alg ecdsa-p256 \
 # /etc/rsyslog.d/mmhashchainsigs-cert.pem
 ```
 
-Supported algorithms: `ed25519` (default) and `ecdsa-p256`.
+Supported algorithms: `ed25519` (default), `ecdsa-p256`, `ecdsa-p384`,
+and `ecdsa-p521`.
 
 ### Configure rsyslog
 
@@ -199,7 +202,7 @@ mmhashchainsigs-verify (-k <pubkey.pem> | -c <cert.pem> | -C <ca.pem>) \
                       [OPTIONS] <logfile>
 
 Trust anchor (exactly one is required):
-  -k, --publickey <path>  Raw PEM public key (Ed25519 or ECDSA P-256)
+  -k, --publickey <path>  Raw PEM public key (Ed25519 or ECDSA P-256/P-384/P-521)
   -c, --cert <path>       Pinned X.509 leaf certificate PEM
   -C, --ca-bundle <path>  PEM bundle of CA certificates; the signer's
                           cert must be embedded in the log (embedcert=on)
@@ -317,9 +320,10 @@ public key.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `privatekey` | string | (required) | Path to private key PEM (Ed25519 or ECDSA P-256) |
+| `privatekey` | string | (required) | Path to private key PEM (Ed25519 or ECDSA P-256/P-384/P-521) |
 | `certificate` | string | (none) | Optional X.509 cert PEM matching the private key. When set, the cert's public key drives the on-wire fingerprint. |
 | `embedcert` | binary | off | Emit the X.509 cert in `[mmhashchainsigs-cert@32473 ...]` on chain INIT lines so verifiers in CA-bundle mode can chain-validate without out-of-band cert distribution. Requires `certificate=`. |
+| `hashalgo` | string | `sha256` | Hash function for the chain. Accepts `sha256`, `sha384`, or `sha512`. The verifier auto-detects from the on-wire `h=` width (64/96/128 hex chars) and locks in for the rest of the file. |
 | `template` | string | rsyslog default | Rsyslog template for hash input |
 | `signinterval` | integer | 1024 | Sign every N messages |
 | `statefiledir` | string | (none) | Directory for shutdown state file; enables final signature on graceful restart |
@@ -456,12 +460,15 @@ cannot deny audit logging by injecting a poisoned SD-ID.
 The chain hash recurrence is:
 
 ```
-H(n) = SHA-256( H(n-1) || seq(n) || payload(n) )
+H(n) = H_alg( H(n-1) || seq(n) || payload(n) )
 ```
 
-where `seq(n)` is the 64-bit big-endian sequence number and
-`payload(n)` is the bytes mmhashchainsigs feeds into SHA-256 for
-message `n`. `payload(n)` is constructed in mmhashchainsigs's
+where `H_alg` is SHA-256 (default), SHA-384, or SHA-512 depending on
+the `hashalgo` config option, `seq(n)` is the 64-bit big-endian sequence
+number, and `payload(n)` is the bytes mmhashchainsigs feeds into the
+chosen hash for message `n`. The well-known IV is
+`H_alg("MMHASHCHAINSIGS_CHAIN_INIT_V1")`, so each algorithm produces a
+distinct initial state. `payload(n)` is constructed in mmhashchainsigs's
 `doAction` from the parsed message fields, *before* the message
 reaches the output template. The verifier reconstructs the same bytes
 from each stored line by stripping the leading

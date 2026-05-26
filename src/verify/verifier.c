@@ -182,16 +182,26 @@ static int verify_sd_msg_hash(
                   (unsigned long)ctx->next_seq);
     }
 
-    unsigned char next[HCS_HASH_LEN];
-    if (hcs_sha256_chain(ctx->chain_hash, ctx->next_seq,
-                            msg, msg_len, next) != 0) {
+    /* Every line after INIT must agree on the hash algorithm. */
+    if (sd->chain_hash_len != ctx->hash_len) {
+        add_error(ctx, line_num,
+                  "chain hash length changed mid-chain"
+                  " (got %zu, expected %zu)",
+                  sd->chain_hash_len, ctx->hash_len);
         ctx->state = VSTATE_ERROR;
         return -1;
     }
-    memcpy(ctx->chain_hash, next, HCS_HASH_LEN);
+
+    unsigned char next[HCS_HASH_MAX_LEN];
+    if (hcs_hash_chain(ctx->hash_alg, ctx->chain_hash, ctx->next_seq,
+                       msg, msg_len, next) != 0) {
+        ctx->state = VSTATE_ERROR;
+        return -1;
+    }
+    memcpy(ctx->chain_hash, next, ctx->hash_len);
 
     if (memcmp(ctx->chain_hash, sd->chain_hash,
-               HCS_HASH_LEN) != 0) {
+               ctx->hash_len) != 0) {
         add_error(ctx, line_num,
                   "chain hash mismatch at seq %lu",
                   (unsigned long)sd->seq);
@@ -257,12 +267,33 @@ static int handle_sd_init(
         ctx->last_signed_seq = 0;
     }
 
-    unsigned char iv[HCS_HASH_LEN];
-    if (hcs_chain_init_hash(iv) != 0) {
+    /* Auto-detect / lock-in the chain hash algorithm from the INIT
+     * line. Once set, every subsequent line must use the same algo. */
+    hcs_hash_alg_t alg;
+    if (hcs_hash_alg_from_hex_len(sd->chain_hash_len * 2, &alg) != 0) {
+        add_error(ctx, line_num,
+                  "INIT chain hash has unsupported length %zu",
+                  sd->chain_hash_len);
         ctx->state = VSTATE_ERROR;
         return -1;
     }
-    memcpy(ctx->chain_hash, iv, HCS_HASH_LEN);
+    if (ctx->have_hash_alg && ctx->hash_alg != alg) {
+        add_error(ctx, line_num,
+            "hash algorithm changed mid-file (was %s, INIT now %s)",
+            hcs_hash_name(ctx->hash_alg), hcs_hash_name(alg));
+        ctx->state = VSTATE_ERROR;
+        return -1;
+    }
+    ctx->hash_alg = alg;
+    ctx->hash_len = hcs_hash_len(alg);
+    ctx->have_hash_alg = true;
+
+    unsigned char iv[HCS_HASH_MAX_LEN];
+    if (hcs_chain_init_hash(ctx->hash_alg, iv) != 0) {
+        ctx->state = VSTATE_ERROR;
+        return -1;
+    }
+    memcpy(ctx->chain_hash, iv, ctx->hash_len);
     ctx->next_seq = 1;
     ctx->segment_count++;
     ctx->state = VSTATE_PROCESSING;
@@ -318,7 +349,7 @@ static int handle_sd_sig(
     }
 
     int vr = hcs_verify(
-        ctx->pubkey, ctx->chain_hash, HCS_HASH_LEN,
+        ctx->pubkey, ctx->chain_hash, ctx->hash_len,
         sd->signature, sd->sig_len);
     if (vr == 1) {
         add_error(ctx, line_num,

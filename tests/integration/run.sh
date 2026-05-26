@@ -59,14 +59,22 @@ generate_keys() {
         -out "$TMPDIR_BASE/pubkey.pem" 2>/dev/null
 }
 
-# Generate an ECDSA P-256 key pair (used by the x509 ecdsa test).
-generate_ecdsa_keys() {
+generate_ecdsa_curve_keys() {
+    local curve="$1"
+    local tag="$2"
     openssl genpkey -algorithm EC \
-        -pkeyopt ec_paramgen_curve:P-256 \
-        -out "$TMPDIR_BASE/privkey-ec.pem" 2>/dev/null
-    chmod 600 "$TMPDIR_BASE/privkey-ec.pem"
-    openssl pkey -in "$TMPDIR_BASE/privkey-ec.pem" -pubout \
-        -out "$TMPDIR_BASE/pubkey-ec.pem" 2>/dev/null
+        -pkeyopt "ec_paramgen_curve:$curve" \
+        -out "$TMPDIR_BASE/privkey-${tag}.pem" 2>/dev/null
+    chmod 600 "$TMPDIR_BASE/privkey-${tag}.pem"
+    openssl pkey -in "$TMPDIR_BASE/privkey-${tag}.pem" -pubout \
+        -out "$TMPDIR_BASE/pubkey-${tag}.pem" 2>/dev/null
+}
+
+# Generate ECDSA key pairs for each supported NIST curve.
+generate_ecdsa_keys() {
+    generate_ecdsa_curve_keys P-256 ec
+    generate_ecdsa_curve_keys P-384 ec384
+    generate_ecdsa_curve_keys P-521 ec521
 }
 
 # Generate a self-signed leaf cert from $TMPDIR_BASE/privkey.pem.
@@ -742,10 +750,13 @@ EOF
     fi
 }
 
-# --- Test: ECDSA P-256 key end-to-end ---
-test_x509_ecdsa_p256() {
-    local logfile="$TMPDIR_BASE/x509-ecdsa.log"
-    local conf="$TMPDIR_BASE/x509-ecdsa.conf"
+# --- Test: ECDSA key end-to-end, parameterized by curve tag ---
+# tag = "ec" (P-256) / "ec384" (P-384) / "ec521" (P-521)
+test_x509_ecdsa_curve() {
+    local tag="$1"
+    local label="$2"
+    local logfile="$TMPDIR_BASE/x509-${tag}.log"
+    local conf="$TMPDIR_BASE/x509-${tag}.conf"
 
     cat > "$conf" <<EOF
 global(workDirectory="$TMPDIR_BASE")
@@ -760,7 +771,7 @@ template(name="sd-preserve" type="string"
 *.* {
     action(
         type="mmhashchainsigs"
-        privatekey="$TMPDIR_BASE/privkey-ec.pem"
+        privatekey="$TMPDIR_BASE/privkey-${tag}.pem"
         signinterval="5"
     )
     action(
@@ -772,19 +783,23 @@ template(name="sd-preserve" type="string"
 EOF
 
     start_rsyslog "$conf"
-    send_and_drain 12 "mmhcs-ecdsa"
+    send_and_drain 12 "mmhcs-${tag}"
 
     if [ ! -f "$logfile" ]; then
         echo "    logfile not created" >&2
         cat "$TMPDIR_BASE/rsyslog.err" >&2
-        report "x509_ecdsa_p256" 1
+        report "x509_ecdsa_${label}" 1
         return
     fi
 
-    "$VERIFY" --publickey "$TMPDIR_BASE/pubkey-ec.pem" "$logfile" \
+    "$VERIFY" --publickey "$TMPDIR_BASE/pubkey-${tag}.pem" "$logfile" \
         >/dev/null 2>&1
-    report "x509_ecdsa_p256" $?
+    report "x509_ecdsa_${label}" $?
 }
+
+test_x509_ecdsa_p256() { test_x509_ecdsa_curve "ec"    "p256"; }
+test_x509_ecdsa_p384() { test_x509_ecdsa_curve "ec384" "p384"; }
+test_x509_ecdsa_p521() { test_x509_ecdsa_curve "ec521" "p521"; }
 
 # --- Test: CA-bundle mode with embedcert=on ---
 test_x509_ca_bundle() {
@@ -856,6 +871,226 @@ EOF
     else
         echo "    good=$good bad=$bad (expected 0, 4)" >&2
         report "x509_ca_bundle" 1
+    fi
+}
+
+# --- Test: SHA-512 chain mode ---
+test_sha512_chain() {
+    local logfile="$TMPDIR_BASE/sha512.log"
+    local conf="$TMPDIR_BASE/sha512.conf"
+
+    cat > "$conf" <<EOF
+global(workDirectory="$TMPDIR_BASE")
+
+module(load="imuxsock" SysSock.Use="off")
+input(type="imuxsock" Socket="$SOCK")
+module(load="$MMHASHCHAINSIGS_SO")
+
+template(name="sd-preserve" type="string"
+    string="%STRUCTURED-DATA%%msg%\n")
+
+*.* {
+    action(
+        type="mmhashchainsigs"
+        privatekey="$TMPDIR_BASE/privkey.pem"
+        hashalgo="sha512"
+        signinterval="5"
+    )
+    action(
+        type="omfile"
+        file="$logfile"
+        template="sd-preserve"
+    )
+}
+EOF
+
+    start_rsyslog "$conf"
+    send_and_drain 12 "mmhcs-sha512"
+
+    if [ ! -f "$logfile" ]; then
+        echo "    logfile not created" >&2
+        cat "$TMPDIR_BASE/rsyslog.err" >&2
+        report "sha512_chain" 1
+        return
+    fi
+
+    # Every line must carry h="<128 hex>" — SHA-512 produces a 64-byte
+    # hash that the formatter renders as 128 hex chars. SHA-256 would
+    # render as 64 hex chars, so this check distinguishes the two.
+    local sha256_lines sha512_lines
+    sha256_lines=$(grep -c 'h="[0-9a-f]\{64\}"' "$logfile" || true)
+    sha512_lines=$(grep -c 'h="[0-9a-f]\{128\}"' "$logfile" || true)
+    if [ "$sha256_lines" -ne 0 ] || [ "$sha512_lines" -eq 0 ]; then
+        echo "    expected only SHA-512 lines, got sha256=$sha256_lines sha512=$sha512_lines" >&2
+        report "sha512_chain" 1
+        return
+    fi
+
+    # Verifier auto-detects from h= width.
+    "$VERIFY" --publickey "$TMPDIR_BASE/pubkey.pem" "$logfile" \
+        >/dev/null 2>&1
+    report "sha512_chain" $?
+}
+
+# --- Test: SHA-384 chain mode ---
+test_sha384_chain() {
+    local logfile="$TMPDIR_BASE/sha384.log"
+    local conf="$TMPDIR_BASE/sha384.conf"
+
+    cat > "$conf" <<EOF
+global(workDirectory="$TMPDIR_BASE")
+
+module(load="imuxsock" SysSock.Use="off")
+input(type="imuxsock" Socket="$SOCK")
+module(load="$MMHASHCHAINSIGS_SO")
+
+template(name="sd-preserve" type="string"
+    string="%STRUCTURED-DATA%%msg%\n")
+
+*.* {
+    action(
+        type="mmhashchainsigs"
+        privatekey="$TMPDIR_BASE/privkey.pem"
+        hashalgo="sha384"
+        signinterval="5"
+    )
+    action(
+        type="omfile"
+        file="$logfile"
+        template="sd-preserve"
+    )
+}
+EOF
+
+    start_rsyslog "$conf"
+    send_and_drain 12 "mmhcs-sha384"
+
+    if [ ! -f "$logfile" ]; then
+        echo "    logfile not created" >&2
+        cat "$TMPDIR_BASE/rsyslog.err" >&2
+        report "sha384_chain" 1
+        return
+    fi
+
+    # Every line must carry h="<96 hex>" (SHA-384 is a 48-byte digest).
+    local sha256_lines sha384_lines sha512_lines
+    sha256_lines=$(grep -c 'h="[0-9a-f]\{64\}"' "$logfile" || true)
+    sha384_lines=$(grep -c 'h="[0-9a-f]\{96\}"' "$logfile" || true)
+    sha512_lines=$(grep -c 'h="[0-9a-f]\{128\}"' "$logfile" || true)
+    if [ "$sha256_lines" -ne 0 ] || [ "$sha512_lines" -ne 0 ] \
+       || [ "$sha384_lines" -eq 0 ]; then
+        echo "    expected only SHA-384 lines, got 256=$sha256_lines 384=$sha384_lines 512=$sha512_lines" >&2
+        report "sha384_chain" 1
+        return
+    fi
+
+    "$VERIFY" --publickey "$TMPDIR_BASE/pubkey.pem" "$logfile" \
+        >/dev/null 2>&1
+    report "sha384_chain" $?
+}
+
+# --- Test: SHA-512 tamper detection (chain works the same way) ---
+test_sha512_tamper() {
+    local logfile="$TMPDIR_BASE/sha512-tamp.log"
+    local conf="$TMPDIR_BASE/sha512-tamp.conf"
+
+    cat > "$conf" <<EOF
+global(workDirectory="$TMPDIR_BASE")
+
+module(load="imuxsock" SysSock.Use="off")
+input(type="imuxsock" Socket="$SOCK")
+module(load="$MMHASHCHAINSIGS_SO")
+
+template(name="sd-preserve" type="string"
+    string="%STRUCTURED-DATA%%msg%\n")
+
+*.* {
+    action(
+        type="mmhashchainsigs"
+        privatekey="$TMPDIR_BASE/privkey.pem"
+        hashalgo="sha512"
+        signinterval="5"
+    )
+    action(
+        type="omfile"
+        file="$logfile"
+        template="sd-preserve"
+    )
+}
+EOF
+
+    start_rsyslog "$conf"
+    send_and_drain 15 "mmhcs-sha512-tamp"
+
+    if [ ! -f "$logfile" ]; then
+        report "sha512_tamper" 1
+        return
+    fi
+
+    local pre post
+    "$VERIFY" -k "$TMPDIR_BASE/pubkey.pem" "$logfile" \
+        >/dev/null 2>&1 && pre=0 || pre=$?
+    sed -i '3s/message/TAMPERED/' "$logfile"
+    "$VERIFY" -k "$TMPDIR_BASE/pubkey.pem" "$logfile" \
+        >/dev/null 2>&1 && post=0 || post=$?
+
+    if [ "$pre" -eq 0 ] && [ "$post" -ne 0 ]; then
+        report "sha512_tamper" 0
+    else
+        echo "    pre=$pre post=$post (expected 0, !0)" >&2
+        report "sha512_tamper" 1
+    fi
+}
+
+# --- Test: rsyslog rejects unknown hashalgo ---
+test_invalid_hashalgo() {
+    local conf="$TMPDIR_BASE/bad-alg.conf"
+    cat > "$conf" <<EOF
+global(workDirectory="$TMPDIR_BASE")
+
+module(load="imuxsock" SysSock.Use="off")
+input(type="imuxsock" Socket="$SOCK")
+module(load="$MMHASHCHAINSIGS_SO")
+
+template(name="sd-preserve" type="string"
+    string="%STRUCTURED-DATA%%msg%\n")
+
+*.* {
+    action(
+        type="mmhashchainsigs"
+        privatekey="$TMPDIR_BASE/privkey.pem"
+        hashalgo="md5"
+        signinterval="5"
+    )
+}
+EOF
+
+    rsyslogd -f "$conf" -i "$TMPDIR_BASE/bad.pid" -n \
+        > "$TMPDIR_BASE/bad.out" 2> "$TMPDIR_BASE/bad.err" &
+    local pid=$!
+    sleep 1
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        # rsyslog tolerates a config-rejected action by entering a
+        # suspended state rather than refusing to start. Look for the
+        # diagnostic in stderr.
+        if grep -q "unknown hashalgo" "$TMPDIR_BASE/bad.err"; then
+            report "invalid_hashalgo" 0
+        else
+            echo "    expected 'unknown hashalgo' diagnostic; got:" >&2
+            cat "$TMPDIR_BASE/bad.err" >&2
+            report "invalid_hashalgo" 1
+        fi
+    else
+        wait "$pid" 2>/dev/null || true
+        if grep -q "unknown hashalgo" "$TMPDIR_BASE/bad.err"; then
+            report "invalid_hashalgo" 0
+        else
+            echo "    rsyslog exited but no expected diagnostic" >&2
+            cat "$TMPDIR_BASE/bad.err" >&2
+            report "invalid_hashalgo" 1
+        fi
     fi
 }
 
@@ -932,8 +1167,14 @@ main() {
     test_no_statefiledir_strict
     test_x509_pinned_cert
     test_x509_ecdsa_p256
+    test_x509_ecdsa_p384
+    test_x509_ecdsa_p521
     test_x509_ca_bundle
     test_x509_ca_bundle_requires_embed
+    test_sha384_chain
+    test_sha512_chain
+    test_sha512_tamper
+    test_invalid_hashalgo
 
     echo ""
     echo "=== Results: $PASS passed, $FAIL failed ==="

@@ -128,6 +128,9 @@ $(BUILDDIR)/tests/test_mmhashchainsigs: tests/test_mmhashchainsigs.c $(MMHASHCHA
 $(BUILDDIR)/tests/test_x509: tests/test_x509.c $(MMHASHCHAINSIGS_OBJS) $(SIGNER_OBJS) $(HASHCHAIN_OBJS) $(VERIFIER_OBJS) $(COMMON_OBJS) | $(BUILDDIR)/tests
 	$(CC) $(CFLAGS) $(CRYPTO_CFLAGS) $(INCLUDES) -I$(SRC_VERIFY) -DMMHASHCHAINSIGS_STANDALONE -o $@ $^ $(CRYPTO_LIBS)
 
+$(BUILDDIR)/tests/test_sha512: tests/test_sha512.c $(MMHASHCHAINSIGS_OBJS) $(SIGNER_OBJS) $(HASHCHAIN_OBJS) $(VERIFIER_OBJS) $(COMMON_OBJS) | $(BUILDDIR)/tests
+	$(CC) $(CFLAGS) $(CRYPTO_CFLAGS) $(INCLUDES) -I$(SRC_VERIFY) -DMMHASHCHAINSIGS_STANDALONE -o $@ $^ $(CRYPTO_LIBS)
+
 test: $(TEST_BINS)
 	@echo "=== Running tests ==="
 	@fail=0; \

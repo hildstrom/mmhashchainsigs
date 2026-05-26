@@ -54,7 +54,7 @@ static void test_sd_init_roundtrip(void)
     memset(fp, 0xbb, HCS_HASH_LEN);
 
     char buf[HCS_SD_MAX_LEN];
-    int n = hcs_format_sd_init(1, hash, fp, buf, sizeof(buf));
+    int n = hcs_format_sd_init(1, hash, HCS_HASH_LEN, fp, buf, sizeof(buf));
     assert(n > 0);
 
     hcs_sd_record_t rec;
@@ -75,7 +75,7 @@ static void test_sd_msg_roundtrip(void)
     memset(hash, 0xcc, HCS_HASH_LEN);
 
     char buf[HCS_SD_MAX_LEN];
-    int n = hcs_format_sd_msg(42, hash, buf, sizeof(buf));
+    int n = hcs_format_sd_msg(42, hash, HCS_HASH_LEN, buf, sizeof(buf));
     assert(n > 0);
 
     hcs_sd_record_t rec;
@@ -98,7 +98,7 @@ static void test_sd_sig_roundtrip(void)
 
     char buf[HCS_SD_MAX_LEN];
     int n = hcs_format_sd_sig(
-        1024, hash, 1, 1024, sig, sizeof(sig),
+        1024, hash, HCS_HASH_LEN, 1, 1024, sig, sizeof(sig),
         buf, sizeof(buf));
     assert(n > 0);
 
@@ -125,7 +125,7 @@ static void test_sd_continue_roundtrip(void)
 
     char buf[HCS_SD_MAX_LEN];
     int n = hcs_format_sd_continue(
-        501, hash, fp, buf, sizeof(buf));
+        501, hash, HCS_HASH_LEN, fp, buf, sizeof(buf));
     assert(n > 0);
 
     hcs_sd_record_t rec;
@@ -146,7 +146,7 @@ static void test_sd_strip(void)
 
     char sd[HCS_SD_MAX_LEN];
     int sd_len = hcs_format_sd_msg(
-        7, hash, sd, sizeof(sd));
+        7, hash, HCS_HASH_LEN, sd, sizeof(sd));
     assert(sd_len > 0);
 
     /* Build a line: "prefix[sd element]suffix" */

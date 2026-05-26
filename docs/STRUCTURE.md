@@ -33,6 +33,7 @@
 │   ├── test_hashchain.c                  Hash chain semantics
 │   ├── test_mmhashchainsigs.c            mmhashchainsigs + verifier integration
 │   ├── test_x509.c                       X.509 cert loading, signer_init_x509, CA-bundle e2e
+│   ├── test_sha512.c                     SHA-512 sign+verify, alg auto-detect, state file roundtrip
 │   └── integration/                      Scripts driving a real rsyslog
 │       ├── send_syslog.c                 Bulk unix-domain syslog sender (C helper)
 │       ├── run.sh                        Functional tests
@@ -60,8 +61,9 @@ rsyslog dependency -- only OpenSSL.
 **hcs_crypto.{c,h}**
 
 Core cryptographic operations using OpenSSL 3.0+ EVP API:
-- `hcs_sha256()` -- Single-shot SHA-256 digest
-- `hcs_sha256_chain()` -- Chain hash: `SHA-256(prev || seq_be64 || msg)`
+- `hcs_hash_alg_t` -- Selects the chain hash function: SHA-256 (default), SHA-384, or SHA-512. Helpers: `hcs_hash_len()`, `hcs_hash_name()`, `hcs_hash_from_name()`, `hcs_hash_alg_from_hex_len()` (verifier auto-detect from on-wire `h=` width).
+- `hcs_sha256()` -- Single-shot SHA-256 digest (fingerprint computation)
+- `hcs_hash_chain(alg, ...)` -- Chain hash: `H_alg(prev || seq_be64 || msg)` for the chosen algorithm
 - `hcs_load_private_key()` / `hcs_load_public_key()` -- PEM key loading (Ed25519 or ECDSA P-256, all other algorithms rejected)
 - `hcs_load_x509_cert()` / `hcs_x509_get_pubkey()` / `hcs_x509_check_keypair()` -- X.509 PEM loading and key/cert match checks
 - `hcs_x509_to_der()` / `hcs_x509_from_der()` -- Cert (de)serialization for embedded-cert SD
@@ -144,11 +146,12 @@ CLI entry point:
 
 | File | Tests | What It Covers |
 |------|-------|----------------|
-| `test_signer.c` | 7 | SHA-256 known vector, chain hash, sign/verify roundtrip for Ed25519 and ECDSA P-256, fingerprint match across both, unsupported-key rejection (RSA) |
+| `test_signer.c` | 11 | SHA-256 known vector, chain hash, sign/verify roundtrip for Ed25519 and ECDSA P-256/P-384/P-521, fingerprint match across each, unsupported-key rejection (RSA) |
 | `test_format.c` | 20 | Hex, base64, SD INIT/MSG/SIG/CONTINUE roundtrip, SD strip, bad input rejection, `hcs_strip_all_sd` (empty/none/single/multiple/quoted-bracket/out-too-small/hdr-id/in-place), `hcs_format_sd_hdr` (basic/empty-fields/escaping/buf-too-small) |
-| `test_hashchain.c` | 6 | Chain init IV, update, determinism, ordering, count reset, full reset |
+| `test_hashchain.c` | 19 | Chain init IV, update, determinism, ordering, count reset, full reset — each run for SHA-256, SHA-384, and SHA-512; plus an alg-distinguishes-chains cross-check |
 | `test_mmhashchainsigs.c` | 17 | SD chain verify, tamper detect, multi-segment, single message, `mmhashchainsigs_process_msg`, sign-interval=1, RFC 5424 with client SD, RFC 5424 collision (poisoned `mmhashchainsigs@32473`), hdr chain verify, hdr tamper detect, hdr collision (poisoned `mmhashchainsigs-hdr@32473`), `final_sign` (covers tail, no unsigned, uninitialized), state save/load roundtrip, state inject+verify (full shutdown/restart flow), state no-unsigned |
-| `test_x509.c` | 8 | Load cert + extract pubkey, RSA cert rejection, `signer_init_x509` happy path / key-cert mismatch / RSA reject, e2e sign-with-cert + verify-with-pinned-cert (ECDSA P-256), e2e CA-bundle (positive + wrong-CA negative), CA-bundle requires `embedcert=on` |
+| `test_x509.c` | 10 | Load cert + extract pubkey, RSA cert rejection, `signer_init_x509` happy path / key-cert mismatch / RSA reject, e2e sign-with-cert + verify-with-pinned-cert (ECDSA P-256), e2e CA-bundle (positive + wrong-CA negative), CA-bundle requires `embedcert=on`, e2e CA-bundle for P-384 and P-521 leaf keys |
+| `test_sha512.c` | 5 | End-to-end with `hashalgo=sha256` / `sha384` / `sha512` (asserts on-wire `h=` width is 64/96/128 hex chars and verifier auto-detect picks the right algorithm), mid-chain algorithm change detected, SHA-512 state file save/load roundtrip |
 
 All tests generate temporary Ed25519 key pairs at runtime. No test fixtures are
 checked in.
@@ -162,7 +165,7 @@ required. They are not part of `make test` (which runs unit tests only).
 | Script / source | What It Covers |
 |-----------------|----------------|
 | `send_syslog.c` | Opens the unix datagram socket once and sends N RFC 3164 messages -- avoids the cost of forking `logger` per message |
-| `run.sh` | 12 tests: `imuxsock`-based write+verify and tamper detection; `imptcp` + `rsyslog.rfc5424` parser tests for RFC 5424 with client SD, SD-ID collision, distinct-per-message header capture, and header-value tamper detection; `statefiledir` shutdown+restart (state file written, consumed on restart, strict verification passes); no-statefiledir strict-mode unsigned-tail detection; X.509 pinned-cert sign+verify (both `--cert` and `--publickey` accept the cert's key); ECDSA P-256 end-to-end; CA-bundle with `embedcert=on` positive + wrong-CA chain-validation failure (exit code 4); CA-bundle missing-embedcert clear-error path |
+| `run.sh` | 18 tests: `imuxsock`-based write+verify and tamper detection; `imptcp` + `rsyslog.rfc5424` parser tests for RFC 5424 with client SD, SD-ID collision, distinct-per-message header capture, and header-value tamper detection; `statefiledir` shutdown+restart (state file written, consumed on restart, strict verification passes); no-statefiledir strict-mode unsigned-tail detection; X.509 pinned-cert sign+verify (both `--cert` and `--publickey` accept the cert's key); ECDSA P-256/P-384/P-521 end-to-end (one test per curve); CA-bundle with `embedcert=on` positive + wrong-CA chain-validation failure (exit code 4); CA-bundle missing-embedcert clear-error path; `hashalgo=sha384` and `hashalgo=sha512` end-to-end with on-wire `h=` width assertions; SHA-512 tamper detection; rsyslog rejects an unknown `hashalgo` value with a clear diagnostic |
 | `bench.sh` | Throughput comparison: baseline omfile vs `mmhashchainsigs` + omfile. Also measures `mmhashchainsigs-verify` throughput |
 
 Both scripts run the sender, sleep briefly so rsyslog can drain the socket

@@ -14,12 +14,61 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define HCS_HASH_LEN    32  /* SHA-256 digest length */
+/*
+ * Pubkey fingerprint length: SHA-256 of raw pubkey bytes, fixed for all
+ * key types. The fingerprint is a key identifier and never changes,
+ * even when the chain hash algorithm is SHA-512.
+ */
+#define HCS_HASH_LEN    32
+
+/*
+ * Maximum chain-hash length across supported algorithms.
+ *   SHA-256: 32 bytes
+ *   SHA-384: 48 bytes
+ *   SHA-512: 64 bytes
+ * Use this for buffers and arrays that may hold any of these sizes;
+ * the actual length in use is tracked by the surrounding context.
+ */
+#define HCS_HASH_MAX_LEN 64
+
 /* Max signature length across supported algorithms:
- *   Ed25519: 64 bytes
- *   ECDSA P-256 (DER): up to ~72 bytes (two 32B integers + ASN.1 overhead)
- * 80 bytes accommodates both with margin. */
-#define HCS_SIG_MAX_LEN 80
+ *   Ed25519:           64 bytes
+ *   ECDSA P-256 (DER): up to ~72 bytes
+ *   ECDSA P-384 (DER): up to ~104 bytes
+ *   ECDSA P-521 (DER): up to ~139 bytes (two 66-byte ints + ASN.1 overhead)
+ * 144 bytes accommodates all with margin. */
+#define HCS_SIG_MAX_LEN 144
+
+/*
+ * Hash algorithm for the chain (sequence-protective hash).
+ * The fingerprint always uses SHA-256.
+ */
+typedef enum {
+    HCS_HASH_SHA256 = 0,
+    HCS_HASH_SHA384 = 2,
+    HCS_HASH_SHA512 = 1
+} hcs_hash_alg_t;
+
+/* Bytes produced by hcs_hash_alg_t (32 or 64). 0 on bad alg. */
+size_t hcs_hash_len(hcs_hash_alg_t alg);
+
+/* "sha256" / "sha512" string for config files and logs. */
+const char *hcs_hash_name(hcs_hash_alg_t alg);
+
+/*
+ * Parse "sha256" / "sha512" (case-insensitive) into an algorithm.
+ * Returns 0 on success, -1 on unknown name.
+ */
+int hcs_hash_from_name(const char *name, hcs_hash_alg_t *out);
+
+/*
+ * Map a hex-encoded chain-hash length back to its algorithm:
+ *   64 hex chars  (32 bytes) -> SHA-256
+ *   96 hex chars  (48 bytes) -> SHA-384
+ *   128 hex chars (64 bytes) -> SHA-512
+ * Returns 0 on success, -1 if the length matches no supported algorithm.
+ */
+int hcs_hash_alg_from_hex_len(size_t hex_len, hcs_hash_alg_t *out);
 
 /* SHA-256 of arbitrary data. Returns 0 on success, -1 on error. */
 int hcs_sha256(
@@ -27,14 +76,16 @@ int hcs_sha256(
     unsigned char out[HCS_HASH_LEN]);
 
 /*
- * Chain hash: SHA-256(prev_hash || seq_be64 || msg).
+ * Chain hash: H(prev_hash || seq_be64 || msg) for the chosen algorithm.
+ * `prev` and `out` must both be at least hcs_hash_len(alg) bytes.
  * Returns 0 on success, -1 on error.
  */
-int hcs_sha256_chain(
-    const unsigned char prev[HCS_HASH_LEN],
+int hcs_hash_chain(
+    hcs_hash_alg_t alg,
+    const unsigned char *prev,
     uint64_t seq,
     const void *msg, size_t msg_len,
-    unsigned char out[HCS_HASH_LEN]);
+    unsigned char *out);
 
 /*
  * Load private key from PEM file. Accepts Ed25519 or ECDSA P-256.

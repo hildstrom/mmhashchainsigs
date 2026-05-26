@@ -14,8 +14,13 @@
 
 static char ed_privkey_path[256];
 static char ed_pubkey_path[256];
-static char ec_privkey_path[256];
-static char ec_pubkey_path[256];
+/* One key pair per supported NIST P-curve. */
+static char ec256_privkey_path[256];
+static char ec256_pubkey_path[256];
+static char ec384_privkey_path[256];
+static char ec384_pubkey_path[256];
+static char ec521_privkey_path[256];
+static char ec521_pubkey_path[256];
 
 static void write_pem_keypair(
     EVP_PKEY *pkey, char *privkey_path, char *pubkey_path)
@@ -48,9 +53,9 @@ static EVP_PKEY *gen_ed25519(void)
     return pkey;
 }
 
-static EVP_PKEY *gen_ecdsa_p256(void)
+static EVP_PKEY *gen_ecdsa(const char *curve)
 {
-    EVP_PKEY *pkey = EVP_EC_gen("P-256");
+    EVP_PKEY *pkey = EVP_EC_gen(curve);
     assert(pkey != NULL);
     return pkey;
 }
@@ -65,21 +70,35 @@ static void setup_test_keys(void)
     write_pem_keypair(ed, ed_privkey_path, ed_pubkey_path);
     EVP_PKEY_free(ed);
 
-    EVP_PKEY *ec = gen_ecdsa_p256();
-    snprintf(ec_privkey_path, sizeof(ec_privkey_path),
-             "/tmp/hcs_test_ec_priv_XXXXXX");
-    snprintf(ec_pubkey_path, sizeof(ec_pubkey_path),
-             "/tmp/hcs_test_ec_pub_XXXXXX");
-    write_pem_keypair(ec, ec_privkey_path, ec_pubkey_path);
-    EVP_PKEY_free(ec);
+    struct { const char *curve; char *priv; char *pub; size_t plen; size_t blen; } ec[] = {
+        { "P-256", ec256_privkey_path, ec256_pubkey_path,
+          sizeof(ec256_privkey_path), sizeof(ec256_pubkey_path) },
+        { "P-384", ec384_privkey_path, ec384_pubkey_path,
+          sizeof(ec384_privkey_path), sizeof(ec384_pubkey_path) },
+        { "P-521", ec521_privkey_path, ec521_pubkey_path,
+          sizeof(ec521_privkey_path), sizeof(ec521_pubkey_path) },
+    };
+    for (size_t i = 0; i < sizeof(ec) / sizeof(*ec); i++) {
+        EVP_PKEY *k = gen_ecdsa(ec[i].curve);
+        snprintf(ec[i].priv, ec[i].plen,
+                 "/tmp/hcs_test_ec_priv_XXXXXX");
+        snprintf(ec[i].pub, ec[i].blen,
+                 "/tmp/hcs_test_ec_pub_XXXXXX");
+        write_pem_keypair(k, ec[i].priv, ec[i].pub);
+        EVP_PKEY_free(k);
+    }
 }
 
 static void cleanup_test_keys(void)
 {
     unlink(ed_privkey_path);
     unlink(ed_pubkey_path);
-    unlink(ec_privkey_path);
-    unlink(ec_pubkey_path);
+    unlink(ec256_privkey_path);
+    unlink(ec256_pubkey_path);
+    unlink(ec384_privkey_path);
+    unlink(ec384_pubkey_path);
+    unlink(ec521_privkey_path);
+    unlink(ec521_pubkey_path);
 }
 
 static void test_sha256(void)
@@ -107,11 +126,11 @@ static void test_sha256_chain(void)
 
     memset(prev, 0xaa, HCS_HASH_LEN);
 
-    assert(hcs_sha256_chain(prev, 1, "msg", 3, out1) == 0);
-    assert(hcs_sha256_chain(prev, 1, "msg", 3, out2) == 0);
+    assert(hcs_hash_chain(HCS_HASH_SHA256, prev, 1, "msg", 3, out1) == 0);
+    assert(hcs_hash_chain(HCS_HASH_SHA256, prev, 1, "msg", 3, out2) == 0);
     assert(memcmp(out1, out2, HCS_HASH_LEN) == 0);
 
-    assert(hcs_sha256_chain(prev, 2, "msg", 3, out2) == 0);
+    assert(hcs_hash_chain(HCS_HASH_SHA256, prev, 2, "msg", 3, out2) == 0);
     assert(memcmp(out1, out2, HCS_HASH_LEN) != 0);
 
     printf("  PASS: test_sha256_chain\n");
@@ -157,9 +176,17 @@ static void test_sign_verify_roundtrip(void)
     /* Ed25519: fixed 64-byte signature. */
     sign_verify_roundtrip_for_keys(
         ed_privkey_path, ed_pubkey_path, 64, 64, "ed25519");
-    /* ECDSA P-256: DER signature is variable, typically 70–72 bytes. */
+    /* ECDSA: variable DER size; typical maxes are ~72 / ~104 / ~139
+     * for P-256 / P-384 / P-521. */
     sign_verify_roundtrip_for_keys(
-        ec_privkey_path, ec_pubkey_path, 8, HCS_SIG_MAX_LEN, "ecdsa-p256");
+        ec256_privkey_path, ec256_pubkey_path,
+        8, HCS_SIG_MAX_LEN, "ecdsa-p256");
+    sign_verify_roundtrip_for_keys(
+        ec384_privkey_path, ec384_pubkey_path,
+        8, HCS_SIG_MAX_LEN, "ecdsa-p384");
+    sign_verify_roundtrip_for_keys(
+        ec521_privkey_path, ec521_pubkey_path,
+        8, HCS_SIG_MAX_LEN, "ecdsa-p521");
 }
 
 static void fingerprint_priv_pub_match(
@@ -186,7 +213,11 @@ static void test_pubkey_fingerprint(void)
     fingerprint_priv_pub_match(
         ed_privkey_path, ed_pubkey_path, "ed25519");
     fingerprint_priv_pub_match(
-        ec_privkey_path, ec_pubkey_path, "ecdsa-p256");
+        ec256_privkey_path, ec256_pubkey_path, "ecdsa-p256");
+    fingerprint_priv_pub_match(
+        ec384_privkey_path, ec384_pubkey_path, "ecdsa-p384");
+    fingerprint_priv_pub_match(
+        ec521_privkey_path, ec521_pubkey_path, "ecdsa-p521");
 }
 
 static void test_reject_unsupported_key(void)

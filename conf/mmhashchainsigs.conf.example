@@ -43,6 +43,11 @@ template(name="sd-preserve" type="string"
         # verifiers can chain-validate without out-of-band distribution.
         # Requires `certificate=`.
         #embedcert="on"
+        # Optional: hash algorithm for the chain. Default is sha256.
+        # Accepted values: sha256 (32B/64 hex), sha384 (48B/96 hex),
+        # sha512 (64B/128 hex). Larger hashes scale the per-message
+        # SD overhead by the listed `h=` width.
+        #hashalgo="sha512"
         signinterval="1024"
         statefiledir="/var/lib/mmhashchainsigs"
         queue.workerThreads="1"

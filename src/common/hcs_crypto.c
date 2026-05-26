@@ -7,6 +7,7 @@
 #include <openssl/err.h>
 #include <openssl/param_build.h>
 #include <openssl/pem.h>
+#include <strings.h>  /* strcasecmp */
 #include <string.h>
 
 int hcs_sha256(
@@ -49,12 +50,68 @@ static void uint64_to_be(uint64_t val, unsigned char buf[8])
     buf[7] = (unsigned char)(val);
 }
 
-int hcs_sha256_chain(
-    const unsigned char prev[HCS_HASH_LEN],
+size_t hcs_hash_len(hcs_hash_alg_t alg)
+{
+    switch (alg) {
+    case HCS_HASH_SHA256: return 32;
+    case HCS_HASH_SHA384: return 48;
+    case HCS_HASH_SHA512: return 64;
+    }
+    return 0;
+}
+
+const char *hcs_hash_name(hcs_hash_alg_t alg)
+{
+    switch (alg) {
+    case HCS_HASH_SHA256: return "sha256";
+    case HCS_HASH_SHA384: return "sha384";
+    case HCS_HASH_SHA512: return "sha512";
+    }
+    return "unknown";
+}
+
+int hcs_hash_from_name(const char *name, hcs_hash_alg_t *out)
+{
+    if (!name) return -1;
+    if (strcasecmp(name, "sha256") == 0) { *out = HCS_HASH_SHA256; return 0; }
+    if (strcasecmp(name, "sha384") == 0) { *out = HCS_HASH_SHA384; return 0; }
+    if (strcasecmp(name, "sha512") == 0) { *out = HCS_HASH_SHA512; return 0; }
+    return -1;
+}
+
+int hcs_hash_alg_from_hex_len(size_t hex_len, hcs_hash_alg_t *out)
+{
+    switch (hex_len) {
+    case 64:  *out = HCS_HASH_SHA256; return 0;
+    case 96:  *out = HCS_HASH_SHA384; return 0;
+    case 128: *out = HCS_HASH_SHA512; return 0;
+    default:  return -1;
+    }
+}
+
+static const EVP_MD *evp_md_for(hcs_hash_alg_t alg)
+{
+    switch (alg) {
+    case HCS_HASH_SHA256: return EVP_sha256();
+    case HCS_HASH_SHA384: return EVP_sha384();
+    case HCS_HASH_SHA512: return EVP_sha512();
+    }
+    return NULL;
+}
+
+int hcs_hash_chain(
+    hcs_hash_alg_t alg,
+    const unsigned char *prev,
     uint64_t seq,
     const void *msg, size_t msg_len,
-    unsigned char out[HCS_HASH_LEN])
+    unsigned char *out)
 {
+    const EVP_MD *md = evp_md_for(alg);
+    size_t hlen = hcs_hash_len(alg);
+    if (!md || hlen == 0) {
+        return -1;
+    }
+
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
     if (!ctx) {
         return -1;
@@ -63,13 +120,13 @@ int hcs_sha256_chain(
     unsigned char seq_buf[8];
     uint64_to_be(seq, seq_buf);
 
-    unsigned int md_len = HCS_HASH_LEN;
+    unsigned int md_len = (unsigned int)hlen;
     int rc = -1;
 
-    if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1) {
+    if (EVP_DigestInit_ex(ctx, md, NULL) != 1) {
         goto done;
     }
-    if (EVP_DigestUpdate(ctx, prev, HCS_HASH_LEN) != 1) {
+    if (EVP_DigestUpdate(ctx, prev, hlen) != 1) {
         goto done;
     }
     if (EVP_DigestUpdate(ctx, seq_buf, sizeof(seq_buf)) != 1) {
@@ -89,9 +146,30 @@ done:
 }
 
 /*
+ * Identify the EC curve. Returns the bit size (256/384/521) for a
+ * supported NIST curve, or 0 if the curve is unsupported.
+ */
+static int ec_curve_bits(EVP_PKEY *key)
+{
+    char group[64] = {0};
+    size_t glen = 0;
+    if (EVP_PKEY_get_group_name(key, group, sizeof(group), &glen) != 1) {
+        return 0;
+    }
+    if (strcmp(group, "prime256v1") == 0
+        || strcmp(group, "P-256") == 0
+        || strcmp(group, "secp256r1") == 0) return 256;
+    if (strcmp(group, "secp384r1") == 0
+        || strcmp(group, "P-384") == 0) return 384;
+    if (strcmp(group, "secp521r1") == 0
+        || strcmp(group, "P-521") == 0) return 521;
+    return 0;
+}
+
+/*
  * Return true if `key` is one of the supported algorithm/curve combos:
  *   Ed25519
- *   ECDSA on the NIST P-256 curve (prime256v1 / secp256r1)
+ *   ECDSA on NIST P-256, P-384, or P-521
  */
 static bool key_is_supported(EVP_PKEY *key)
 {
@@ -100,14 +178,7 @@ static bool key_is_supported(EVP_PKEY *key)
         return true;
     }
     if (id == EVP_PKEY_EC) {
-        char group[64] = {0};
-        size_t glen = 0;
-        if (EVP_PKEY_get_group_name(key, group, sizeof(group), &glen) != 1) {
-            return false;
-        }
-        return strcmp(group, "prime256v1") == 0
-            || strcmp(group, "P-256") == 0
-            || strcmp(group, "secp256r1") == 0;
+        return ec_curve_bits(key) != 0;
     }
     return false;
 }
@@ -217,8 +288,16 @@ static int pick_md(EVP_PKEY *key, const EVP_MD **md_out)
         return 0;
     }
     if (id == EVP_PKEY_EC) {
-        *md_out = EVP_sha256();
-        return 0;
+        /* Pair each NIST curve with its standard digest:
+         *   P-256 -> SHA-256
+         *   P-384 -> SHA-384
+         *   P-521 -> SHA-512 (per FIPS 186-4 / RFC 5480 §4) */
+        switch (ec_curve_bits(key)) {
+        case 256: *md_out = EVP_sha256(); return 0;
+        case 384: *md_out = EVP_sha384(); return 0;
+        case 521: *md_out = EVP_sha512(); return 0;
+        default:  return -1;
+        }
     }
     return -1;
 }
@@ -330,8 +409,9 @@ int hcs_pubkey_fingerprint(
 
     if (id == EVP_PKEY_EC) {
         /* OSSL_PKEY_PARAM_PUB_KEY returns the uncompressed point form
-         * (0x04 || X || Y) which is 65 bytes for P-256. */
-        unsigned char raw[128];
+         * (0x04 || X || Y): 65 bytes for P-256, 97 for P-384, 133 for
+         * P-521. The 256-byte buffer leaves headroom. */
+        unsigned char raw[256];
         size_t raw_len = 0;
         if (EVP_PKEY_get_octet_string_param(
                 key, OSSL_PKEY_PARAM_PUB_KEY,

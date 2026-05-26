@@ -68,7 +68,7 @@ typedef struct {
 
 static void builder_init(sd_builder_t *b, int sign_interval)
 {
-    hashchain_init(&b->chain);
+    hashchain_init(&b->chain, HCS_HASH_SHA256);
     assert(signer_init(&b->signer, privkey_path) == 0);
     b->sig_seq_from = 1;
     b->sign_interval = sign_interval;
@@ -94,10 +94,11 @@ static int builder_add_msg(
     char sd[HCS_SD_MAX_LEN];
     int sd_len;
 
+    size_t hlen = b->chain.hash_len;
     switch (sd_type) {
     case SD_LINE_INIT:
         sd_len = hcs_format_sd_init(
-            seq, b->chain.current, b->signer.pubkey_fp,
+            seq, b->chain.current, hlen, b->signer.pubkey_fp,
             sd, sizeof(sd));
         break;
     case SD_LINE_SIG: {
@@ -105,9 +106,9 @@ static int builder_add_msg(
         size_t slen = sizeof(sig_buf);
         assert(hcs_sign(
             b->signer.privkey, b->chain.current,
-            HCS_HASH_LEN, sig_buf, &slen) == 0);
+            b->chain.hash_len, sig_buf, &slen) == 0);
         sd_len = hcs_format_sd_sig(
-            seq, b->chain.current,
+            seq, b->chain.current, hlen,
             b->sig_seq_from, seq,
             sig_buf, slen, sd, sizeof(sd));
         b->sig_seq_from = seq + 1;
@@ -116,12 +117,12 @@ static int builder_add_msg(
     }
     case SD_LINE_CONTINUE:
         sd_len = hcs_format_sd_continue(
-            seq, b->chain.current, b->signer.pubkey_fp,
+            seq, b->chain.current, hlen, b->signer.pubkey_fp,
             sd, sizeof(sd));
         break;
     default:
         sd_len = hcs_format_sd_msg(
-            seq, b->chain.current, sd, sizeof(sd));
+            seq, b->chain.current, hlen, sd, sizeof(sd));
         break;
     }
 
@@ -310,7 +311,7 @@ static void test_sd_single_message(void)
     size_t slen = sizeof(sig_buf);
     assert(hcs_sign(
         b.signer.privkey, b.chain.current,
-        HCS_HASH_LEN, sig_buf, &slen) == 0);
+        b.chain.hash_len, sig_buf, &slen) == 0);
 
     /*
      * First message must be INIT. We can't combine INIT+SIG in one
@@ -318,7 +319,7 @@ static void test_sd_single_message(void)
      */
     char sd[HCS_SD_MAX_LEN];
     int sd_len = hcs_format_sd_init(
-        seq, b.chain.current, b.signer.pubkey_fp,
+        seq, b.chain.current, b.chain.hash_len, b.signer.pubkey_fp,
         sd, sizeof(sd));
     assert(sd_len > 0);
 
@@ -335,10 +336,10 @@ static void test_sd_single_message(void)
     slen = sizeof(sig_buf);
     assert(hcs_sign(
         b.signer.privkey, b.chain.current,
-        HCS_HASH_LEN, sig_buf, &slen) == 0);
+        b.chain.hash_len, sig_buf, &slen) == 0);
 
     sd_len = hcs_format_sd_sig(
-        seq, b.chain.current, 1, seq,
+        seq, b.chain.current, b.chain.hash_len, 1, seq,
         sig_buf, slen, sd, sizeof(sd));
     assert(sd_len > 0);
 

@@ -30,7 +30,7 @@ int mmhashchainsigs_init(mmhashchainsigs_worker_t *wrkr)
     if (rc != 0) {
         return -1;
     }
-    if (hashchain_init(&wrkr->chain) != 0) {
+    if (hashchain_init(&wrkr->chain, wrkr->inst->hash_alg) != 0) {
         signer_free(&wrkr->signer);
         return -1;
     }
@@ -75,9 +75,10 @@ int mmhashchainsigs_process_msg(
     int sd_len;
 
     bool emit_cert = false;
+    size_t hlen = wrkr->chain.hash_len;
     if (wrkr->is_first) {
         sd_len = hcs_format_sd_init(
-            seq, wrkr->chain.current,
+            seq, wrkr->chain.current, hlen,
             signer_pubkey_fp(&wrkr->signer),
             sd_buf, sd_buf_len);
         wrkr->is_first = 0;
@@ -88,12 +89,12 @@ int mmhashchainsigs_process_msg(
         size_t sig_len = sizeof(sig);
         if (signer_sign(&wrkr->signer,
                         hashchain_get_current(&wrkr->chain),
-                        HCS_HASH_LEN,
+                        hlen,
                         sig, &sig_len) != 0) {
             return -1;
         }
         sd_len = hcs_format_sd_sig(
-            seq, wrkr->chain.current,
+            seq, wrkr->chain.current, hlen,
             wrkr->sig_seq_from, seq,
             sig, sig_len,
             sd_buf, sd_buf_len);
@@ -101,7 +102,7 @@ int mmhashchainsigs_process_msg(
         hashchain_reset_count(&wrkr->chain);
     } else {
         sd_len = hcs_format_sd_msg(
-            seq, wrkr->chain.current,
+            seq, wrkr->chain.current, hlen,
             sd_buf, sd_buf_len);
     }
 
@@ -155,13 +156,13 @@ int mmhashchainsigs_final_sign(
     size_t sig_len = sizeof(sig);
     if (signer_sign(&wrkr->signer,
                     hashchain_get_current(&wrkr->chain),
-                    HCS_HASH_LEN,
+                    wrkr->chain.hash_len,
                     sig, &sig_len) != 0) {
         return -1;
     }
 
     int sd_len = hcs_format_sd_sig(
-        seq, wrkr->chain.current,
+        seq, wrkr->chain.current, wrkr->chain.hash_len,
         wrkr->sig_seq_from, seq,
         sig, sig_len,
         sd_buf, sd_buf_len);
@@ -184,14 +185,23 @@ int mmhashchainsigs_process_final(
                state->pubkey_fp, HCS_HASH_LEN) != 0) {
         return -2;
     }
+    /* Saved state's hash algorithm must match this instance's config —
+     * otherwise the chain we'd extend is a different cryptographic chain. */
+    if (state->hash_alg != wrkr->inst->hash_alg) {
+        return -2;
+    }
 
+    /* Re-initialize the chain in the saved alg, then overlay saved state. */
+    if (hashchain_init(&wrkr->chain, state->hash_alg) != 0) {
+        return -1;
+    }
     memcpy(wrkr->chain.current,
-           state->chain_hash, HCS_HASH_LEN);
+           state->chain_hash, state->hash_len);
     wrkr->chain.seq = state->seq;
 
     if (hashchain_update(&wrkr->chain,
                          payload, payload_len) != 0) {
-        hashchain_init(&wrkr->chain);
+        hashchain_init(&wrkr->chain, wrkr->inst->hash_alg);
         return -1;
     }
 
@@ -201,19 +211,19 @@ int mmhashchainsigs_process_final(
     size_t sig_len = sizeof(sig);
     if (signer_sign(&wrkr->signer,
                     hashchain_get_current(&wrkr->chain),
-                    HCS_HASH_LEN,
+                    wrkr->chain.hash_len,
                     sig, &sig_len) != 0) {
-        hashchain_init(&wrkr->chain);
+        hashchain_init(&wrkr->chain, wrkr->inst->hash_alg);
         return -1;
     }
 
     int sd_len = hcs_format_sd_sig(
-        seq, wrkr->chain.current,
+        seq, wrkr->chain.current, wrkr->chain.hash_len,
         state->sig_seq_from, seq,
         sig, sig_len,
         sd_buf, sd_buf_len);
 
-    hashchain_init(&wrkr->chain);
+    hashchain_init(&wrkr->chain, wrkr->inst->hash_alg);
     wrkr->is_first = 1;
     wrkr->sig_seq_from = 1;
 
@@ -242,19 +252,21 @@ int mmhashchainsigs_save_state(
         return -1;
     }
 
-    char chain_hex[HCS_HEX_HASH_LEN + 1];
+    char chain_hex[HCS_HEX_HASH_MAX_LEN + 1];
     char fp_hex[HCS_HEX_HASH_LEN + 1];
     hcs_hex_encode(wrkr->chain.current,
-                   HCS_HASH_LEN, chain_hex);
+                   wrkr->chain.hash_len, chain_hex);
     hcs_hex_encode(signer_pubkey_fp(&wrkr->signer),
                    HCS_HASH_LEN, fp_hex);
 
     fprintf(f,
             MMHASHCHAINSIGS_STATE_MAGIC "\n"
+            "hashalgo=%s\n"
             "chain_hash=%s\n"
             "seq=%lu\n"
             "sig_seq_from=%lu\n"
             "pubkey_fp=%s\n",
+            hcs_hash_name(wrkr->chain.alg),
             chain_hex,
             (unsigned long)wrkr->chain.seq,
             (unsigned long)wrkr->sig_seq_from,
@@ -298,14 +310,32 @@ mmhashchainsigs_saved_state_t *mmhashchainsigs_load_state(
         return NULL;
     }
 
+    /* Default to SHA-256 if the older V1 layout (no hashalgo= line)
+     * is found on disk, so state files written before SHA-512 support
+     * continue to load correctly. */
+    st->hash_alg = HCS_HASH_SHA256;
+    st->hash_len = hcs_hash_len(HCS_HASH_SHA256);
+
     int got = 0;
     while (fgets(line, sizeof(line), f)) {
-        char val[128];
+        char val[256];
         unsigned long ul;
-        if (sscanf(line, "chain_hash=%64s", val) == 1
-            && strlen(val) == HCS_HEX_HASH_LEN) {
-            if (hcs_hex_decode(val, HCS_HEX_HASH_LEN,
-                    st->chain_hash, HCS_HASH_LEN) == 0) {
+        if (sscanf(line, "hashalgo=%63s", val) == 1) {
+            hcs_hash_alg_t a;
+            if (hcs_hash_from_name(val, &a) != 0) {
+                fclose(f);
+                free(st);
+                return NULL;
+            }
+            st->hash_alg = a;
+            st->hash_len = hcs_hash_len(a);
+        } else if (sscanf(line, "chain_hash=%128s", val) == 1) {
+            size_t hex_len = strlen(val);
+            hcs_hash_alg_t a;
+            if (hcs_hash_alg_from_hex_len(hex_len, &a) != 0) continue;
+            size_t hlen = hcs_hash_len(a);
+            if (hcs_hex_decode(val, hex_len,
+                    st->chain_hash, hlen) == 0) {
                 got |= 1;
             }
         } else if (sscanf(line, "seq=%lu", &ul) == 1) {
@@ -410,6 +440,7 @@ static struct cnfparamdescr actpdescr[] = {
     { "privatekey",    eCmdHdlrString,      CNFPARAM_REQUIRED },
     { "certificate",   eCmdHdlrString,      0 },
     { "embedcert",     eCmdHdlrBinary,      0 },
+    { "hashalgo",      eCmdHdlrString,      0 },
     { "template",      eCmdHdlrString,      0 },
     { "signinterval",  eCmdHdlrPositiveInt,  0 },
     { "statefiledir",  eCmdHdlrString,      0 },
@@ -423,6 +454,7 @@ static struct cnfparamblk actpblk = {
 BEGINcreateInstance
 CODESTARTcreateInstance
     pData->inst.sign_interval = MMHASHCHAINSIGS_DEFAULT_SIGN_INTERVAL;
+    pData->inst.hash_alg = HCS_HASH_SHA256;
 ENDcreateInstance
 
 BEGINcreateWrkrInstance
@@ -498,6 +530,21 @@ CODESTARTnewActInst
         } else if (!strcmp(actpblk.descr[i].name,
                            "embedcert")) {
             pData->inst.embedcert = (int)pvals[i].val.d.n;
+        } else if (!strcmp(actpblk.descr[i].name,
+                           "hashalgo")) {
+            char *name = (char *)es_str2cstr(
+                pvals[i].val.d.estr, NULL);
+            hcs_hash_alg_t a;
+            if (name == NULL || hcs_hash_from_name(name, &a) != 0) {
+                LogError(0, RS_RET_CONFIG_ERROR,
+                    "mmhashchainsigs: unknown hashalgo '%s'"
+                    " (use sha256 or sha512)",
+                    name ? name : "(null)");
+                free(name);
+                ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+            }
+            free(name);
+            pData->inst.hash_alg = a;
         } else if (!strcmp(actpblk.descr[i].name,
                            "template")) {
             pData->inst.tpl_name =

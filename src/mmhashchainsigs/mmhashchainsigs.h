@@ -17,7 +17,9 @@
 #define MMHASHCHAINSIGS_STATE_FILE "mmhashchainsigs.state"
 
 typedef struct mmhashchainsigs_saved_state {
-    unsigned char chain_hash[HCS_HASH_LEN];
+    hcs_hash_alg_t hash_alg;
+    size_t hash_len;
+    unsigned char chain_hash[HCS_HASH_MAX_LEN];
     uint64_t seq;
     uint64_t sig_seq_from;
     unsigned char pubkey_fp[HCS_HASH_LEN];
@@ -30,6 +32,7 @@ typedef struct mmhashchainsigs_instance {
     char *statefiledir;
     unsigned int sign_interval;
     int embedcert;         /* emit cert in INIT/CONTINUE SD (Phase 3) */
+    hcs_hash_alg_t hash_alg; /* hash for the chain (SHA-256 default) */
 } mmhashchainsigs_instance_t;
 
 typedef struct mmhashchainsigs_worker {

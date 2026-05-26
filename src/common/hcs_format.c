@@ -9,10 +9,26 @@
 #include <stdlib.h>
 #include <string.h>
 
-int hcs_chain_init_hash(unsigned char out[HCS_HASH_LEN])
+int hcs_chain_init_hash(hcs_hash_alg_t alg, unsigned char *out)
 {
-    return hcs_sha256(
-        HCS_CHAIN_IV, strlen(HCS_CHAIN_IV), out);
+    const EVP_MD *md;
+    switch (alg) {
+    case HCS_HASH_SHA256: md = EVP_sha256(); break;
+    case HCS_HASH_SHA384: md = EVP_sha384(); break;
+    case HCS_HASH_SHA512: md = EVP_sha512(); break;
+    default: return -1;
+    }
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) return -1;
+    unsigned int md_len = (unsigned int)hcs_hash_len(alg);
+    int rc = -1;
+    if (EVP_DigestInit_ex(ctx, md, NULL) != 1) goto done;
+    if (EVP_DigestUpdate(ctx, HCS_CHAIN_IV, strlen(HCS_CHAIN_IV)) != 1) goto done;
+    if (EVP_DigestFinal_ex(ctx, out, &md_len) != 1) goto done;
+    rc = 0;
+done:
+    EVP_MD_CTX_free(ctx);
+    return rc;
 }
 
 void hcs_hex_encode(
@@ -82,13 +98,14 @@ int hcs_b64_decode(
 
 int hcs_format_sd_init(
     uint64_t seq,
-    const unsigned char chain_hash[HCS_HASH_LEN],
+    const unsigned char *chain_hash, size_t chain_hash_len,
     const unsigned char pubkey_fp[HCS_HASH_LEN],
     char *buf, size_t buf_len)
 {
-    char h[HCS_HEX_HASH_LEN + 1];
+    if (chain_hash_len > HCS_HASH_MAX_LEN) return -1;
+    char h[HCS_HEX_HASH_MAX_LEN + 1];
     char f[HCS_HEX_HASH_LEN + 1];
-    hcs_hex_encode(chain_hash, HCS_HASH_LEN, h);
+    hcs_hex_encode(chain_hash, chain_hash_len, h);
     hcs_hex_encode(pubkey_fp, HCS_HASH_LEN, f);
     int n = snprintf(buf, buf_len,
         "[%s t=\"I\" q=\"%lu\" h=\"%s\" f=\"%s\"]",
@@ -99,11 +116,12 @@ int hcs_format_sd_init(
 
 int hcs_format_sd_msg(
     uint64_t seq,
-    const unsigned char chain_hash[HCS_HASH_LEN],
+    const unsigned char *chain_hash, size_t chain_hash_len,
     char *buf, size_t buf_len)
 {
-    char h[HCS_HEX_HASH_LEN + 1];
-    hcs_hex_encode(chain_hash, HCS_HASH_LEN, h);
+    if (chain_hash_len > HCS_HASH_MAX_LEN) return -1;
+    char h[HCS_HEX_HASH_MAX_LEN + 1];
+    hcs_hex_encode(chain_hash, chain_hash_len, h);
     int n = snprintf(buf, buf_len,
         "[%s q=\"%lu\" h=\"%s\"]",
         HCS_SD_ID, (unsigned long)seq, h);
@@ -113,14 +131,15 @@ int hcs_format_sd_msg(
 
 int hcs_format_sd_sig(
     uint64_t seq,
-    const unsigned char chain_hash[HCS_HASH_LEN],
+    const unsigned char *chain_hash, size_t chain_hash_len,
     uint64_t seq_from, uint64_t seq_to,
     const unsigned char *signature, size_t sig_len,
     char *buf, size_t buf_len)
 {
-    char h[HCS_HEX_HASH_LEN + 1];
+    if (chain_hash_len > HCS_HASH_MAX_LEN) return -1;
+    char h[HCS_HEX_HASH_MAX_LEN + 1];
     char s[HCS_B64_SIG_LEN + 4];
-    hcs_hex_encode(chain_hash, HCS_HASH_LEN, h);
+    hcs_hex_encode(chain_hash, chain_hash_len, h);
     if (hcs_b64_encode(signature, sig_len, s, sizeof(s)) < 0) {
         return -1;
     }
@@ -238,13 +257,14 @@ int hcs_extract_and_strip_cert_sd(
 
 int hcs_format_sd_continue(
     uint64_t seq,
-    const unsigned char chain_hash[HCS_HASH_LEN],
+    const unsigned char *chain_hash, size_t chain_hash_len,
     const unsigned char pubkey_fp[HCS_HASH_LEN],
     char *buf, size_t buf_len)
 {
-    char h[HCS_HEX_HASH_LEN + 1];
+    if (chain_hash_len > HCS_HASH_MAX_LEN) return -1;
+    char h[HCS_HEX_HASH_MAX_LEN + 1];
     char f[HCS_HEX_HASH_LEN + 1];
-    hcs_hex_encode(chain_hash, HCS_HASH_LEN, h);
+    hcs_hex_encode(chain_hash, chain_hash_len, h);
     hcs_hex_encode(pubkey_fp, HCS_HASH_LEN, f);
     int n = snprintf(buf, buf_len,
         "[%s t=\"C\" q=\"%lu\" h=\"%s\" f=\"%s\"]",
@@ -357,11 +377,35 @@ static int sd_extract_hex(
     size_t vlen;
     const char *v = sd_get_param(body, end, key, &vlen);
     if (!v || vlen != out_len * 2) return -1;
-    char hex[HCS_HEX_HASH_LEN + 1];
+    char hex[HCS_HEX_HASH_MAX_LEN + 1];
     if (vlen >= sizeof(hex)) return -1;
     memcpy(hex, v, vlen);
     hex[vlen] = '\0';
     return hcs_hex_decode(hex, vlen, out, out_len);
+}
+
+/*
+ * Decode the variable-length chain-hash hex value h="..." into out, and
+ * report the byte length actually decoded (32 for SHA-256, 64 for SHA-512).
+ * out must be at least HCS_HASH_MAX_LEN bytes.
+ */
+static int sd_extract_chain_hash(
+    const char *body, const char *end,
+    unsigned char *out, size_t *out_len)
+{
+    size_t vlen;
+    const char *v = sd_get_param(body, end, "h", &vlen);
+    if (!v) return -1;
+    hcs_hash_alg_t alg;
+    if (hcs_hash_alg_from_hex_len(vlen, &alg) != 0) return -1;
+    size_t hlen = hcs_hash_len(alg);
+    char hex[HCS_HEX_HASH_MAX_LEN + 1];
+    if (vlen >= sizeof(hex)) return -1;
+    memcpy(hex, v, vlen);
+    hex[vlen] = '\0';
+    if (hcs_hex_decode(hex, vlen, out, hlen) != 0) return -1;
+    *out_len = hlen;
+    return 0;
 }
 
 static int sd_extract_uint64(
@@ -406,8 +450,8 @@ int hcs_parse_sd(
     if (sd_extract_uint64(body, end, "q", &out->seq) != 0) {
         return -1;
     }
-    if (sd_extract_hex(body, end, "h",
-                       out->chain_hash, HCS_HASH_LEN) != 0) {
+    if (sd_extract_chain_hash(body, end,
+                              out->chain_hash, &out->chain_hash_len) != 0) {
         return -1;
     }
 

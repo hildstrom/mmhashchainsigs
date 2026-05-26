@@ -44,6 +44,13 @@ static EVP_PKEY *gen_ecdsa_p256(void)
     return pkey;
 }
 
+static EVP_PKEY *gen_ecdsa(const char *curve)
+{
+    EVP_PKEY *pkey = EVP_EC_gen(curve);
+    assert(pkey);
+    return pkey;
+}
+
 static EVP_PKEY *gen_rsa(void)
 {
     EVP_PKEY *pkey = NULL;
@@ -516,6 +523,82 @@ static void test_ca_bundle_requires_embedcert(void)
     printf("  PASS: test_ca_bundle_requires_embedcert\n");
 }
 
+/* End-to-end sign+verify using a cert wrapping a P-384 or P-521 key,
+ * plus chain validation via a CA bundle. Exercises the larger
+ * signature/buffer sizes added for these curves. */
+static void test_e2e_ca_bundle_curve(const char *curve)
+{
+    EVP_PKEY *ca_key = gen_ed25519();
+    X509 *ca_cert = make_cert(ca_key, ca_key, NULL, "test-CA",
+                              0, 7 * 24 * 3600);
+    EVP_PKEY *leaf_key = gen_ecdsa(curve);
+    X509 *leaf_cert = make_cert(leaf_key, ca_key, ca_cert, "test-leaf",
+                                0, 3600);
+
+    char ca_path[256] = "/tmp/hcs_test_ca_curve_XXXXXX";
+    char leaf_priv_path[256] = "/tmp/hcs_test_lpriv_XXXXXX";
+    char leaf_cert_path[256] = "/tmp/hcs_test_lcert_XXXXXX";
+    write_cert_pem(ca_cert, ca_path);
+    write_privkey_pem(leaf_key, leaf_priv_path);
+    write_cert_pem(leaf_cert, leaf_cert_path);
+
+    mmhashchainsigs_instance_t inst = {0};
+    inst.privkey_path = leaf_priv_path;
+    inst.cert_path = leaf_cert_path;
+    inst.sign_interval = 3;
+    inst.embedcert = 1;
+
+    mmhashchainsigs_worker_t wrkr = {0};
+    wrkr.inst = &inst;
+    assert(mmhashchainsigs_init(&wrkr) == 0);
+
+    FILE *fp = tmpfile();
+    for (int i = 0; i < 7; i++) {
+        char msg[64];
+        int mlen = snprintf(msg, sizeof(msg), "msg-%d", i);
+        char sd[HCS_SD_WITH_CERT_MAX_LEN];
+        int sd_len = mmhashchainsigs_process_msg(
+            &wrkr, msg, (size_t)mlen, sd, sizeof(sd));
+        assert(sd_len > 0);
+        fprintf(fp, "%s%s\n", sd, msg);
+    }
+    mmhashchainsigs_free(&wrkr);
+
+    rewind(fp);
+    verifier_ctx_t vctx;
+    verifier_opts_t opts = {.ca_bundle_path = ca_path};
+    assert(verifier_init(&vctx, &opts) == 0);
+
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t len;
+    uint64_t n = 0;
+    while ((len = getline(&line, &cap, fp)) != -1) {
+        n++;
+        while (len > 0
+               && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            len--;
+        }
+        assert(verifier_process_line(
+            &vctx, line, (size_t)len, n) == 0);
+    }
+    verifier_finalize(&vctx);
+    assert(verifier_passed(&vctx));
+    assert(vctx.msg_count == 7);
+    verifier_free(&vctx);
+    free(line);
+
+    fclose(fp);
+    X509_free(leaf_cert);
+    X509_free(ca_cert);
+    EVP_PKEY_free(leaf_key);
+    EVP_PKEY_free(ca_key);
+    unlink(ca_path);
+    unlink(leaf_priv_path);
+    unlink(leaf_cert_path);
+    printf("  PASS: test_e2e_ca_bundle[%s]\n", curve);
+}
+
 int main(void)
 {
     printf("test_x509:\n");
@@ -527,6 +610,8 @@ int main(void)
     test_e2e_sign_with_cert_verify_with_pinned_cert();
     test_e2e_ca_bundle();
     test_ca_bundle_requires_embedcert();
+    test_e2e_ca_bundle_curve("P-384");
+    test_e2e_ca_bundle_curve("P-521");
     printf("All x509 tests passed.\n");
     return 0;
 }

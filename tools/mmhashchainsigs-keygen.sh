@@ -10,16 +10,17 @@ set -euo pipefail
 #             a full PKI (pin the leaf cert at each verifier).
 #   csr       Generate a key and a CSR for an external CA to sign.
 #
-# Algorithms (--alg): ed25519 (default), ecdsa-p256.
+# Algorithms (--alg): ed25519 (default), ecdsa-p256, ecdsa-p384, ecdsa-p521.
 
 usage() {
     cat >&2 <<EOF
 Usage:
-  $0 [keygen]  [--alg ed25519|ecdsa-p256] [--outdir DIR]
-  $0 selfsign  [--alg ed25519|ecdsa-p256] [--outdir DIR]
-               [--cn NAME] [--days N]
-  $0 csr       [--alg ed25519|ecdsa-p256] [--outdir DIR]
-               [--cn NAME]
+  $0 [keygen]  [--alg ed25519|ecdsa-p256|ecdsa-p384|ecdsa-p521]
+               [--outdir DIR]
+  $0 selfsign  [--alg ed25519|ecdsa-p256|ecdsa-p384|ecdsa-p521]
+               [--outdir DIR] [--cn NAME] [--days N]
+  $0 csr       [--alg ed25519|ecdsa-p256|ecdsa-p384|ecdsa-p521]
+               [--outdir DIR] [--cn NAME]
 
 Outputs are written under DIR (default: current directory):
   mmhashchainsigs-private.pem  (mode 0600)
@@ -56,7 +57,9 @@ done
 case "$ALG" in
     ed25519)    GENPKEY_ARGS=(-algorithm Ed25519) ;;
     ecdsa-p256) GENPKEY_ARGS=(-algorithm EC -pkeyopt ec_paramgen_curve:P-256) ;;
-    *) echo "Unsupported --alg: $ALG (use ed25519 or ecdsa-p256)" >&2; exit 2 ;;
+    ecdsa-p384) GENPKEY_ARGS=(-algorithm EC -pkeyopt ec_paramgen_curve:P-384) ;;
+    ecdsa-p521) GENPKEY_ARGS=(-algorithm EC -pkeyopt ec_paramgen_curve:P-521) ;;
+    *) echo "Unsupported --alg: $ALG (use ed25519, ecdsa-p256, ecdsa-p384, or ecdsa-p521)" >&2; exit 2 ;;
 esac
 
 mkdir -p "$OUTDIR"

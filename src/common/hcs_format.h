@@ -16,21 +16,27 @@
 
 #define HCS_CHAIN_IV "MMHASHCHAINSIGS_CHAIN_INIT_V1"
 
-/* Hex-encoded SHA-256 hash: 64 chars + NUL */
+/* Hex-encoded SHA-256 (fingerprint) length: 64 chars. */
 #define HCS_HEX_HASH_LEN (HCS_HASH_LEN * 2)
+/* Hex-encoded chain hash, sized for the larger of SHA-256/SHA-512. */
+#define HCS_HEX_HASH_MAX_LEN (HCS_HASH_MAX_LEN * 2)
 
-/* Base64-encoded signature, sized to cover HCS_SIG_MAX_LEN (80 bytes):
- *   Ed25519 (64B)     -> 88 chars
- *   ECDSA P-256 (72B) -> 96 chars
- *   ceil(80 / 3) * 4  = 108 chars
+/* Base64-encoded signature, sized to cover HCS_SIG_MAX_LEN (144 bytes):
+ *   Ed25519 (64B)      -> 88  chars
+ *   ECDSA P-256 (72B)  -> 96  chars
+ *   ECDSA P-384 (104B) -> 140 chars
+ *   ECDSA P-521 (139B) -> 188 chars
+ *   ceil(144 / 3) * 4  = 192 chars
  * Round up for safety. */
-#define HCS_B64_SIG_LEN 112
+#define HCS_B64_SIG_LEN 200
 
 /*
- * Compute the well-known chain initialization hash:
- * SHA-256("MMHASHCHAINSIGS_CHAIN_INIT_V1")
+ * Compute the well-known chain initialization hash for the given
+ * algorithm: H_alg("MMHASHCHAINSIGS_CHAIN_INIT_V1").
+ * `out` must be at least hcs_hash_len(alg) bytes.
+ * Returns 0 on success, -1 on error.
  */
-int hcs_chain_init_hash(unsigned char out[HCS_HASH_LEN]);
+int hcs_chain_init_hash(hcs_hash_alg_t alg, unsigned char *out);
 
 /* Utility: encode bytes to hex string (NUL-terminated) */
 void hcs_hex_encode(
@@ -63,7 +69,9 @@ int hcs_b64_decode(
 #define HCS_SD_ID      "mmhashchainsigs@32473"
 #define HCS_SD_HDR_ID  "mmhashchainsigs-hdr@32473"
 #define HCS_SD_CERT_ID "mmhashchainsigs-cert@32473"
-#define HCS_SD_MAX_LEN 384
+/* Worst case is the SIG element with a SHA-512 chain hash (128 hex)
+ * and an ECDSA P-521 base64 signature (~192 chars). */
+#define HCS_SD_MAX_LEN 512
 /* Larger because escaped host/app/procid/msgid values can be long. */
 #define HCS_SD_HDR_MAX_LEN 1024
 /* Sized to hold base64 of a CA-issued cert (~1500 bytes DER -> ~2000 b64). */
@@ -83,7 +91,8 @@ typedef enum {
 typedef struct {
     hcs_sd_type_t type;
     uint64_t seq;
-    unsigned char chain_hash[HCS_HASH_LEN];
+    unsigned char chain_hash[HCS_HASH_MAX_LEN];
+    size_t chain_hash_len;   /* set by hcs_parse_sd from h= hex width */
     unsigned char pubkey_fp[HCS_HASH_LEN];
     bool has_pubkey_fp;
     uint64_t seq_from;
@@ -95,29 +104,31 @@ typedef struct {
 
 /*
  * Format SD elements. buf must be HCS_SD_MAX_LEN bytes.
+ * `chain_hash` is `chain_hash_len` bytes (32 for SHA-256, 64 for SHA-512).
+ * `pubkey_fp` is always HCS_HASH_LEN (32) bytes.
  * Returns bytes written (excluding NUL), or -1 on error.
  */
 int hcs_format_sd_init(
     uint64_t seq,
-    const unsigned char chain_hash[HCS_HASH_LEN],
+    const unsigned char *chain_hash, size_t chain_hash_len,
     const unsigned char pubkey_fp[HCS_HASH_LEN],
     char *buf, size_t buf_len);
 
 int hcs_format_sd_msg(
     uint64_t seq,
-    const unsigned char chain_hash[HCS_HASH_LEN],
+    const unsigned char *chain_hash, size_t chain_hash_len,
     char *buf, size_t buf_len);
 
 int hcs_format_sd_sig(
     uint64_t seq,
-    const unsigned char chain_hash[HCS_HASH_LEN],
+    const unsigned char *chain_hash, size_t chain_hash_len,
     uint64_t seq_from, uint64_t seq_to,
     const unsigned char *signature, size_t sig_len,
     char *buf, size_t buf_len);
 
 int hcs_format_sd_continue(
     uint64_t seq,
-    const unsigned char chain_hash[HCS_HASH_LEN],
+    const unsigned char *chain_hash, size_t chain_hash_len,
     const unsigned char pubkey_fp[HCS_HASH_LEN],
     char *buf, size_t buf_len);
 
